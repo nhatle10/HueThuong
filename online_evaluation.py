@@ -17,30 +17,30 @@ from sklearn import metrics
 from sklearn.model_selection import KFold
 from scipy import interpolate
 
-def read_data():
-    
-    # S7 = '/home/swapnilkhandoker/Bachelor_Thesis/project/utils/stage7_feature_extraction/mavceleb_baseline/features_v3'
-    # test_file_face  = S7 + '/faces/valid/no_gender/Bangla_valid_faces.csv'
-    # test_file_voice = S7 + '/voices/valid/no_gender/Bangla_valid_voices.csv'
-    # S7 = '/home/swapnilkhandoker/Bachelor_Thesis/project/utils/stage7_feature_extraction/mavceleb_baseline/resamplingsplit_v3_hard'
-    S7 = '/home/swapnilkhandoker/Bachelor_Thesis/project/utils/stage7_feature_extraction/mavceleb_baseline/features_v1x'   # CHANGED
-    test_file_face  = S7 + '/faces/valid/no_gender/Bangla_valid_faces.csv'
-    test_file_voice = S7 + '/voices/valid/no_gender/Bangla_valid_voices.csv'
+import os
 
-    print('Reading Test Faces')
-    face_test = pd.read_csv(test_file_face, header=None)
-    print('Reading Test Voices')
-    voice_test = pd.read_csv(test_file_voice, header=None)
-    
-    face_test = np.asarray(face_test)
-    face_test = face_test[:,:4096]
-    voice_test = np.asarray(voice_test)
-    voice_test = voice_test[:,:512]
-    
+def read_data_from_config(cfg, track="no_gender", language="Bangla"):
+    """
+    Loads dev evaluation features dynamically from the config paths.
+    track: 'no_gender' or 'gender'
+    language: 'English' or 'Bangla'
+    """
+    dev_root = cfg.data.dev.root
+    face_path = os.path.join(dev_root, track, "features", f"{language}_test_faces.csv")
+    voice_path = os.path.join(dev_root, track, "features", f"{language}_test_voices.csv")
+
+    print(f'Reading Test Faces from: {face_path}')
+    face_test = pd.read_csv(face_path, header=None).values[:, :cfg.data.train.face_dim]
+
+    print(f'Reading Test Voices from: {voice_path}')
+    voice_test = pd.read_csv(voice_path, header=None).values[:, :cfg.data.train.voice_dim]
+
     face_test = torch.from_numpy(face_test).float()
     voice_test = torch.from_numpy(voice_test).float()
     return face_test, voice_test
 
+def read_data():
+    return None, None
 
 # In[1]
 
@@ -160,12 +160,12 @@ def evaluate(embeddings, actual_issame, nrof_folds=10):
     return tpr, fpr, accuracy, val, val_std, far
 
 def test(args, model, face_test, voice_test):
+    use_cuda = (args.model.cuda if hasattr(args, 'model') and hasattr(args.model, 'cuda') else getattr(args, 'cuda', False)) and torch.cuda.is_available()
 
     model.eval()
-    model.cuda()
- 
-    if args.cuda:
-        face_test, voice_test= face_test.cuda(), voice_test.cuda()
+    if use_cuda:
+        model.cuda()
+        face_test, voice_test = face_test.cuda(), voice_test.cuda()
 
     face_test, voice_test = Variable(face_test), Variable(voice_test)
     with torch.no_grad():

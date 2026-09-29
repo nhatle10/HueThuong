@@ -60,8 +60,8 @@ Linear Weighted Addition
 class LinearWeightedAvg(nn.Module):
     def __init__(self, face_feat_dim, voice_feat_dim):
         super(LinearWeightedAvg, self).__init__()
-        self.weight1 = nn.Parameter(torch.rand(1, device='cuda')).requires_grad_()
-        self.weight2 = nn.Parameter(torch.rand(1, device='cuda')).requires_grad_() 
+        self.weight1 = nn.Parameter(torch.rand(1))
+        self.weight2 = nn.Parameter(torch.rand(1))
     def forward(self, face_feat, voice_feat):
         return self.weight1 * face_feat + self.weight2 * voice_feat, face_feat, voice_feat
 
@@ -72,7 +72,7 @@ Embedding Extraction Module
 class EmbedBranch(nn.Module):
     def __init__(self, feat_dim, embedding_dim):
         super(EmbedBranch, self).__init__()
-        self.fc1 = make_fc_1d(feat_dim, embedding_dim).cuda()
+        self.fc1 = make_fc_1d(feat_dim, embedding_dim)
 
     def forward(self, x):
         x = self.fc1(x)
@@ -97,7 +97,7 @@ class FOP(nn.Module):
         
         self.logits_layer = nn.Linear(args.dim_embed, n_class)
 
-        if args.cuda:
+        if getattr(args, 'cuda', False) and torch.cuda.is_available():
             self.cuda()
 
     def forward(self, faces, voices):

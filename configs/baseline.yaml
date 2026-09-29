@@ -1,0 +1,35 @@
+run:
+  name: "baseline"
+  tag: "english"
+  seed: 1
+  save_dir: "output/checkpoints"
+
+data:
+  train:
+    faces: "data/FLAG_Grand_Challenge_2027_15_09_2027/train_set_extracted/train_set/features/faces/train_English_faces.csv"
+    voices: "data/FLAG_Grand_Challenge_2027_15_09_2027/train_set_extracted/train_set/features/voices/train_English_voices.csv"
+    meta_csv: "data/FLAG_Grand_Challenge_2027_15_09_2027/meta_file_train_set.csv"
+    face_dim: 4096
+    voice_dim: 192
+  dev:
+    root: "data/FLAG_Grand_Challenge_2027_15_09_2027/dev_set_extracted/dev_set"
+    tracks:
+      - "no_gender"
+      - "gender"
+    languages:
+      - "English"
+      - "Bangla"
+      
+model:
+  name: "FOP"
+  fusion: "gated"       # "gated" or "linear"
+  dim_embed: 128
+  cuda: true
+train:
+  batch_size: 128
+  lr: 0.00001
+  weight_decay: 0.01
+  max_num_epoch: 200
+  patience: 20
+  min_delta: 0.0005
+  alpha_list: [2.0]     # Weight for OPL loss
