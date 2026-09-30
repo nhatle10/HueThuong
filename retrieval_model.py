@@ -84,20 +84,20 @@ Main Module
 '''
 
 class FOP(nn.Module):
-    def __init__(self, args, face_feat_dim, voice_feat_dim,n_class):
+    def __init__(self, cfg, face_feat_dim, voice_feat_dim,n_class):
         super(FOP, self).__init__()
         
-        self.voice_branch = EmbedBranch(voice_feat_dim, args.dim_embed)
-        self.face_branch = EmbedBranch(face_feat_dim, args.dim_embed)
+        self.voice_branch = EmbedBranch(voice_feat_dim, cfg.dim_embed)
+        self.face_branch = EmbedBranch(face_feat_dim, cfg.dim_embed)
         
-        if args.fusion == 'linear':
-            self.fusion_layer = LinearWeightedAvg(args.dim_embed, args.dim_embed)
-        elif args.fusion == 'gated':
-            self.fusion_layer = GatedFusion(face_feat_dim, voice_feat_dim, args.dim_embed, 128, args.dim_embed)
+        if cfg.fusion == 'linear':
+            self.fusion_layer = LinearWeightedAvg(cfg.dim_embed, cfg.dim_embed)
+        elif cfg.fusion == 'gated':
+            self.fusion_layer = GatedFusion(face_feat_dim, voice_feat_dim, cfg.dim_embed, 128, cfg.dim_embed)
         
-        self.logits_layer = nn.Linear(args.dim_embed, n_class)
+        self.logits_layer = nn.Linear(cfg.dim_embed, n_class)
 
-        if getattr(args, 'cuda', False) and torch.cuda.is_available():
+        if getattr(cfg, 'cuda', False) and torch.cuda.is_available():
             self.cuda()
 
     def forward(self, faces, voices):

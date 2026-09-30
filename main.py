@@ -32,6 +32,9 @@ from tqdm import tqdm
 from utils_config import load_config
 from retrieval_model import FOP
 
+EPS_1E3 = 1e-3
+EPS_1E6 = 1e-6
+
 def read_train_data(cfg):
     print(f"Reading Train Faces from: {cfg.data.train.faces}")
     img_train = pd.read_csv(cfg.data.train.faces, header=None)
@@ -72,194 +75,143 @@ def init_weights(m):
         torch.nn.init.xavier_uniform_(m.weight)
         m.bias.data.fill_(0.01)
 
-def main(face_train, voice_train, train_label, face_test, voice_test):
+def main(face_train, voice_train, train_label, face_test, voice_test, cfg):
+    device = torch.device('cuda' if cfg.model.cuda and torch.cuda.is_available() else 'cpu')
+    print(f" + Training on device: {device}")
+    
     n_class = int(np.max(train_label)) + 1
     print('  + n_class: %d' % n_class)
-    model = FOP(FLAGS, face_train.shape[1], voice_train.shape[1], n_class)
+    
+    model = FOP(cfg.model, face_train.shape[1], voice_train.shape[1], n_class)
     model.apply(init_weights)
-    
-    ce_loss = nn.CrossEntropyLoss()
-    opl_loss = OrthogonalProjectionLoss()
-    
-    if FLAGS.cuda:
-        model.cuda()
-        ce_loss.cuda()    
-        opl_loss.cuda()
+    model.to(device)
+
+    ce_loss = nn.CrossEntropyLoss().to(device)
+    opl_loss = OrthogonalProjectionLoss(device)
+
+    if device.type == 'cuda':
+        # Faster training since PyTorch 1.12
         cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cudnn.allow_tf32 = True
     
-# =============================================================================
-#     For Linear Fusion
-# =============================================================================
-    
-    if FLAGS.fusion == 'linear':
-    
+    # Optimizer parameters based on fusion type ('linear' and 'gated')
+    if cfg.model.fusion == 'linear':
         parameters = [
                       {'params' : model.face_branch.fc1.parameters()},
                       {'params' : model.voice_branch.fc1.parameters()},
                       {'params': model.logits_layer.parameters()},
                         {'params' : model.fusion_layer.weight1},
                         {'params' : model.fusion_layer.weight2}]
-    
-    
-# =============================================================================
-#     For Gated Fusion
-# =============================================================================
-    
-    elif FLAGS.fusion == 'gated':
-    
+    elif cfg.model.fusion == 'gated':
         parameters = [
                       {'params' : model.face_branch.fc1.parameters()},
                       {'params' : model.voice_branch.fc1.parameters()},
                       {'params': model.logits_layer.parameters()},
                       {'params' : model.fusion_layer.attention.parameters()}]
-
-    optimizer = optim.Adam(parameters, lr=FLAGS.lr, weight_decay=0.01)
-
+    
+    optimizer = optim.Adam(parameters, lr=cfg.train.lr, weight_decay=getattr(cfg.train, 'weight_decay', EPS_1E3))
+    
+    os.makedirs('output', exist_ok=True)
+    results = []
     n_parameters = sum([p.data.nelement() for p in model.parameters()])
     print('  + Number of params: {}'.format(n_parameters))
 
-    os.makedirs('output', exist_ok=True)                              # <<< CHANGE 14
-    results = []                                                      # <<< CHANGE 15
-
-    for alpha in FLAGS.alpha_list:
+    for alpha in cfg.train.alpha_list:
         eer_list = []
-        epoch=1
-        num_of_batches = (len(train_label) // FLAGS.batch_size)
-        loss_plot = []
-        auc_list = []
+        epoch = 1
+        num_of_batches = len(train_label) // cfg.train.batch_size
+        loss_plot, auc_list = [], []
         loss_per_epoch = 0
-        # save_dir = '%s_%s_alpha_%0.2f'%(FLAGS.fusion, FLAGS.save_dir, alpha)
-        save_dir = os.path.join(FLAGS.save_dir,                                   # <<< CHANGE 7
-                                '%s_%s_alpha_%0.2f'%(FLAGS.fusion, FLAGS.tag, alpha))
 
-        # txt = 'output/%s_ce_opl_%03d_%0.2f.txt'%(FLAGS.fusion, FLAGS.max_num_epoch, alpha)   # <<< CHANGE 14
-        txt = 'output/%s_%s_ce_opl_%03d_%0.2f.txt'%(FLAGS.fusion, FLAGS.tag,      # <<< CHANGE 14
-                                                    FLAGS.max_num_epoch, alpha)
-        
-        with open(txt,'w+') as f:
-            # f.write('EPOCH\tLOSS\tEER\tAUC\n')                                  # <<< CHANGE 8
-            f.write('EPOCH\tLOSS\tVAL_EER\tVAL_AUC\tBEST_EER\n')                  # <<< CHANGE 8
-        
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-        
-        # save_best = 'best_%s'%(save_dir)
-        save_best = os.path.join(FLAGS.save_dir,                                  # <<< CHANGE 7
-                                 'best_%s_%s_alpha_%0.2f'%(FLAGS.fusion, FLAGS.tag, alpha))
-        
-        # if not os.path.exists(save_best):                                       # <<< CHANGE 7
-        #     os.mkdir(save_best)          # os.mkdir cannot create parent dirs
-        os.makedirs(save_best, exist_ok=True)                                     # <<< CHANGE 7
+        save_dir = os.path.join(cfg.run.save_dir, f"{cfg.model.fusion}_{cfg.run.tag}_alpha_{alpha:0.2f}")
+        save_best = os.path.join(cfg.run.save_dir, f"best_{cfg.model.fusion}_{cfg.run.tag}_alpha_{alpha:0.2f}")
+        os.makedirs(save_dir, exist_ok=True)
+        os.makedirs(save_best, exist_ok=True)
 
-        min_eer, max_auc = 1.0, 0.0                                               # <<< CHANGE 8
-        best_eer = 1.0; best_epoch = 0; since_improved = 0                        # <<< CHANGE 8
+        txt = f"output/{cfg.model.fusion}_{cfg.run.tag}_ce_opl_{cfg.train.max_num_epoch:03d}_{alpha:0.2f}.txt"
+        with open(txt, 'w+') as f:
+            f.write('EPOCH\tLOSS\tVAL_EER\tVAL_AUC\tBEST_EER\n')
 
-        with open(txt,'a+') as f:
-            # while (epoch < FLAGS.max_num_epoch):        # ran one epoch short   # <<< CHANGE 8
-            while (epoch <= FLAGS.max_num_epoch):                                 # <<< CHANGE 8
-                print('Epoch %03d'%(epoch))
-                for idx in range(num_of_batches):
-                    face_feats, batch_labels = get_batch(idx, FLAGS.batch_size, train_label, face_train)
-                    voice_feats, _ = get_batch(idx, FLAGS.batch_size, train_label, voice_train)
-                    loss_tmp, loss_opl, loss_soft, _, _ = train(face_feats, voice_feats, 
-                                                                 batch_labels, 
-                                                                 model, optimizer, ce_loss, opl_loss, alpha)
-                    loss_per_epoch+=loss_tmp
-                loss_per_epoch = loss_per_epoch/num_of_batches
-                loss_plot.append(loss_per_epoch)
-                save_checkpoint({
-                    'epoch': epoch,
-                    'state_dict': model.state_dict()}, save_dir, 'checkpoint_%04d.pth.tar'%(epoch))
-                print('==> Epoch: %d/%d Loss: %0.2f Alpha:%0.2f'%(epoch, FLAGS.max_num_epoch, loss_per_epoch, alpha))
+        best_eer = 1.0; best_epoch = 0; since_improved = 0
+        with open(txt, 'a+') as f:
+            while epoch <= cfg.train.max_num_epoch:
+                print('Epoch %03d' % epoch)
                 
-                eer, auc = online_evaluation.test(FLAGS, model, face_test, voice_test)
+                for idx in range(num_of_batches):
+                    face_feats, batch_labels = get_batch(idx, cfg.train.batch_size, train_label, face_train)
+                    voice_feats, _ = get_batch(idx, cfg.train.batch_size, train_label, voice_train)
+
+                    loss_tmp, loss_opl, loss_soft, _, _ = train(
+                        face_feats, voice_feats, batch_labels,
+                        model, optimizer, ce_loss, opl_loss, alpha, device
+                    )
+                    loss_per_epoch += loss_tmp
+                    
+                loss_per_epoch = loss_per_epoch / num_of_batches
+                loss_plot.append(loss_per_epoch)
+                
+                save_checkpoint({'epoch': epoch, 'state_dict': model.state_dict()}, save_dir, f"checkpoint_{epoch:04d}.pth.tar")
+                
+                print('==> Epoch: %d/%d Loss: %0.2f Alpha:%0.2f' % (epoch, cfg.train.max_num_epoch, loss_per_epoch, alpha))
+                
+                eer, auc = online_evaluation.test(cfg, model, face_test, voice_test)
                 eer_list.append(eer)
                 auc_list.append(auc)
 
-                # <<< CHANGE 8: was  if eer <= min(eer_list):  -- eer_list already
-                # contains the current value, so `<=` re-saved on every plateau.
-                # A strict improvement of at least --min_delta now counts.
-                # if eer <= min(eer_list):
-                #     min_eer = eer
-                #     max_auc = auc
-                #     save_checkpoint({
-                #     'epoch': epoch,
-                #     'state_dict': model.state_dict()}, save_best, 'checkpoint_%04d.pth.tar'%(epoch))
-                if eer < best_eer - FLAGS.min_delta:                              # <<< CHANGE 8
+                if eer < best_eer - cfg.train.min_delta:
                     best_eer = eer; best_epoch = epoch; since_improved = 0
-                    min_eer = eer
-                    max_auc = auc
                     save_checkpoint({
                         'epoch': epoch,
                         'state_dict': model.state_dict(),
                         'val_eer': eer, 'val_auc': auc,
                         'alpha': alpha, 'n_class': n_class,
-                        'tag': FLAGS.tag},
-                        save_best, 'checkpoint_best.pth.tar')
-                else:                                                             # <<< CHANGE 8
+                        'tag': cfg.run.tag
+                    }, save_best, 'checkpoint_best.pth.tar')
+                else:
                     since_improved += 1
 
                 print('    val EER %.4f  val AUC %.4f  best %.4f @%d  patience %d/%d'
-                      % (eer, auc, best_eer, best_epoch, since_improved, FLAGS.patience))
-
+                      % (eer, auc, best_eer, best_epoch, since_improved, cfg.train.patience))
                 epoch += 1
-                # f.write('%04d\t%0.4f\t%0.2f\t%0.2f\n'%(epoch, loss_per_epoch, eer, auc))   # <<< CHANGE 8
-                f.write('%04d\t%0.4f\t%0.4f\t%0.4f\t%0.4f\n'                      # <<< CHANGE 8
-                        % (epoch - 1, loss_per_epoch, eer, auc, best_eer))
-                f.flush()                                                         # <<< CHANGE 8
+                
+                f.write(f"{epoch - 1:04d}\t{loss_per_epoch:0.4f}\t{eer:0.4f}\t{auc:0.4f}\t{best_eer:0.4f}\n")
+                f.flush()
                 loss_per_epoch = 0
-
-                if since_improved >= FLAGS.patience:                              # <<< CHANGE 8
-                    print('Early stop at epoch %d: no val improvement > %.4g for '
-                          '%d epochs. Best val EER %.4f at epoch %d.'
-                          % (epoch - 1, FLAGS.min_delta, FLAGS.patience,
-                             best_eer, best_epoch))
+                
+                if since_improved >= cfg.train.patience:
+                    print(f"Early stop at epoch {epoch - 1}: Best val EER {best_eer:.4f} at epoch {best_epoch}.")
                     break
         
-        plt.figure(1)
-        plt.title('Total Loss_%f'%(alpha))
-        plt.plot(loss_plot)
-        plt.savefig('output/%s_%s_%0.2f_total_loss.jpg'%(FLAGS.fusion, FLAGS.tag, alpha), dpi=800)
-        plt.clf()                                                                 # <<< CHANGE 15
-        
-        plt.figure(2)
-        plt.title('EER_%f'%(alpha))
-        plt.plot(eer_list)
-        plt.savefig('output/%s_%s_%0.2f_eer.jpg'%(FLAGS.fusion, FLAGS.tag, alpha), dpi=800)
-        plt.clf()                                                                 # <<< CHANGE 15
-        
-        plt.figure(3)
-        plt.title('AUC_%f'%(alpha))
-        plt.plot(auc_list)
-        plt.savefig('output/%s_%s_%0.2f_auc.jpg'%(FLAGS.fusion, FLAGS.tag, alpha), dpi=800)
-        plt.clf()                                                                 # <<< CHANGE 15
+            # Save plots
+        plt.figure(1); plt.title(f"Total Loss_{alpha:f}"); plt.plot(loss_plot)
+        plt.savefig(f"output/{cfg.model.fusion}_{cfg.run.tag}_{alpha:0.2f}_total_loss.jpg", dpi=800); plt.clf()
 
-        print('  best checkpoint: %s/checkpoint_best.pth.tar (epoch %d, val EER %.4f)'
-              % (save_best, best_epoch, best_eer))
-        results.append((alpha, best_eer, max_auc, best_epoch))                    # <<< CHANGE 15
+        plt.figure(2); plt.title(f"EER_{alpha:f}"); plt.plot(eer_list)
+        plt.savefig(f"output/{cfg.model.fusion}_{cfg.run.tag}_{alpha:0.2f}_eer.jpg", dpi=800); plt.clf()
 
-        # <<< CHANGE 15: this `return` sat INSIDE the alpha loop, so only the
-        # first alpha ever ran. Dedented to after the loop.
-        # return loss_plot, min_eer, max_auc
+        plt.figure(3); plt.title(f"AUC_{alpha:f}"); plt.plot(auc_list)
+        plt.savefig(f"output/{cfg.model.fusion}_{cfg.run.tag}_{alpha:0.2f}_auc.jpg", dpi=800); plt.clf()
 
-    print('\n%s\nSUMMARY (%s)\n%s' % ('=' * 60, FLAGS.tag, '=' * 60))             # <<< CHANGE 15
+        results.append((alpha, best_eer, max(auc_list), best_epoch))
+
+    print(f"\n{'='*60}\nSUMMARY ({cfg.run.tag})\n{'='*60}")
     print('%-8s%-12s%-12s%s' % ('alpha', 'val_EER', 'val_AUC', 'best_epoch'))
+    
     for a, e, u, ep in results:
         print('%-8.2f%-12.4f%-12.4f%d' % (a, e, u, ep))
+
     best = min(results, key=lambda r: r[1])
-    print('\nLowest val EER: alpha %.2f, %.4f at epoch %d' % (best[0], best[1], best[3]))
-    print('Select this alpha and checkpoint, THEN evaluate on test.')
-    return loss_plot, best[1], best[2]                                            # <<< CHANGE 15
+    print(f"\nLowest val EER: alpha {best[0]:.2f}, {best[1]:.4f} at epoch {best[3]}")
+    return loss_plot, best[1], best[2]    # <<< CHANGE 15
     
 class OrthogonalProjectionLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, device):
         super(OrthogonalProjectionLoss, self).__init__()
-        self.device = (torch.device('cuda') if FLAGS.cuda else torch.device('cpu'))
+        self.device = device
 
     def forward(self, features, labels=None):
-        
         features = F.normalize(features, p=2, dim=1)
-
         labels = labels[:, None]
 
         mask = torch.eq(labels, labels.t()).bool().to(self.device)
@@ -269,44 +221,36 @@ class OrthogonalProjectionLoss(nn.Module):
         mask_neg = (~mask).float()
         dot_prod = torch.matmul(features, features.t())
 
-        pos_pairs_mean = (mask_pos * dot_prod).sum() / (mask_pos.sum() + 1e-6)
-        neg_pairs_mean = torch.abs(mask_neg * dot_prod).sum() / (mask_neg.sum() + 1e-6)
+        pos_pairs_mean = (mask_pos * dot_prod).sum() / (mask_pos.sum() + EPS_1E6)
+        neg_pairs_mean = torch.abs(mask_neg * dot_prod).sum() / (mask_neg.sum() + EPS_1E6)
 
         loss = (1.0 - pos_pairs_mean) + (0.7 * neg_pairs_mean)
-
         return loss, pos_pairs_mean, neg_pairs_mean
 
 
-def train(face_feats, voice_feats, labels, model, optimizer, ce_loss, opl_loss, alpha):
-    
+def train(face_feats, voice_feats, labels, model, optimizer, ce_loss, opl_loss, alpha, device):
     average_loss = RunningAverage()
     soft_losses = RunningAverage()
     opl_losses = RunningAverage()
 
     model.train()
-    face_feats = torch.from_numpy(face_feats).float()
-    voice_feats = torch.from_numpy(voice_feats).float()
-    labels = torch.from_numpy(labels)
-    
-    if FLAGS.cuda:
-        face_feats, voice_feats, labels = face_feats.cuda(), voice_feats.cuda(), labels.cuda()
+    face_feats = torch.from_numpy(face_feats).float().to(device)
+    voice_feats = torch.from_numpy(voice_feats).float().to(device)
+    labels = torch.from_numpy(labels).to(device)
 
     face_feats, voice_feats, labels = Variable(face_feats), Variable(voice_feats), Variable(labels)
     comb, face_embeds, voice_embeds = model.train_forward(face_feats, voice_feats, labels)
     
     loss_opl, s_fac, d_fac = opl_loss(comb[0], labels)
-    
     loss_soft = ce_loss(comb[1], labels)
-    
     loss = loss_soft + alpha * loss_opl
 
     optimizer.zero_grad()
-    
     loss.backward()
+    
     average_loss.update(loss.item())
     opl_losses.update(loss_opl.item())
     soft_losses.update(loss_soft.item())
-    
     optimizer.step()
 
     return average_loss.avg(), opl_losses.avg(), soft_losses.avg(), s_fac, d_fac
@@ -338,35 +282,17 @@ if __name__ == '__main__':
 
     cfg = load_config(cli_args.config)
 
-    class ConfigFlags:
-        pass
+    # Set seeds
+    torch.manual_seed(cfg.run.seed)
+    random.seed(cfg.run.seed)
+    np.random.seed(cfg.run.seed)
+    if cfg.model.cuda and torch.cuda.is_available():
+        torch.cuda.manual_seed(cfg.run.seed)
 
-    global FLAGS
-    FLAGS = ConfigFlags()
-    FLAGS.cuda = cfg.model.cuda and torch.cuda.is_available()
-    FLAGS.fusion = cfg.model.fusion
-    FLAGS.dim_embed = cfg.model.dim_embed
-    FLAGS.lr = cfg.train.lr
-    FLAGS.weight_decay = getattr(cfg.train, 'weight_decay', 0.01)
-    FLAGS.batch_size = cfg.train.batch_size
-    FLAGS.max_num_epoch = cfg.train.max_num_epoch
-    FLAGS.alpha_list = cfg.train.alpha_list if isinstance(cfg.train.alpha_list, list) else [float(cfg.train.alpha_list)]
-    FLAGS.patience = cfg.train.patience
-    FLAGS.min_delta = cfg.train.min_delta
-    FLAGS.save_dir = cfg.run.save_dir
-    FLAGS.tag = cfg.run.tag
-    FLAGS.seed = cfg.run.seed
-
-    torch.manual_seed(FLAGS.seed)
-    random.seed(FLAGS.seed)
-    np.random.seed(FLAGS.seed)
-    if FLAGS.cuda:
-        torch.cuda.manual_seed(FLAGS.seed)
-
-    print('[cfg] tag=%s save_dir=%s alphas=%s batch=%d patience=%d'
-          % (FLAGS.tag, FLAGS.save_dir, FLAGS.alpha_list, FLAGS.batch_size, FLAGS.patience))
+    print(f"[cfg] tag={cfg.run.tag} save_dir={cfg.run.save_dir} alphas={cfg.train.alpha_list} "
+          f"batch={cfg.train.batch_size} patience={cfg.train.patience}")
 
     face_train, voice_train, train_label = read_train_data(cfg)
     face_test, voice_test = online_evaluation.read_data_from_config(cfg, track="no_gender", language="Bangla")
 
-    loss_tmp, eer_tmp, auc_tmp = main(face_train, voice_train, train_label, face_test, voice_test)
+    loss_tmp, eer_tmp, auc_tmp = main(face_train, voice_train, train_label, face_test, voice_test, cfg)
