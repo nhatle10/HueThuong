@@ -16,7 +16,11 @@ def read_test_pair_features(face_path, voice_path, face_dim=4096, voice_dim=192)
 
 
 def evaluate_and_generate_scores(
-    cfg, ckpt_path, track="no_gender", heard_lang="English"
+    cfg,
+    ckpt_path,
+    track="no_gender",
+    heard_lang="English",
+    compute_dummy_metrics=False,
 ):
     unheard_lang = "Bangla" if heard_lang == "English" else "English"
     dev_root = cfg.data.dev.root
@@ -52,11 +56,13 @@ def evaluate_and_generate_scores(
     )
 
     # 2. Build model and load weights
-    n_class = 70
-    model = FOP(cfg.model, face_dim, voice_dim, n_class).to(device)
     checkpoint = torch.load(
         ckpt_path, weights_only=False, map_location=device
     )
+    n_class = (
+        checkpoint.get("n_class", 70) if isinstance(checkpoint, dict) else 70
+    )
+    model = FOP(cfg.model, face_dim, voice_dim, n_class).to(device)
     state_dict = (
         checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
     )
@@ -97,23 +103,31 @@ def evaluate_and_generate_scores(
         for k, s in zip(keys_u, scores_u):
             f.write(f"{k} {s:.6f}\n")
 
-    print(f"  Saved: {out_h} ({len(keys_h)} pairs)")
-    print(f"  Saved: {out_u} ({len(keys_u)} pairs)")
+    print(f"  [Inference] Saved {heard_lang} (Heard)   : {out_h} ({len(keys_h)} trials)")
+    print(f"  [Inference] Saved {unheard_lang} (Unheard) : {out_u} ({len(keys_u)} trials)")
 
-    # 6. Compute verification metrics
-    eer_h, auc_h = evaluate_model(model, face_h, voice_h, device)
-    eer_u, auc_u = evaluate_model(model, face_u, voice_u, device)
-    print(f"  -> {heard_lang} (Heard)   : EER = {eer_h*100:.2f}% | AUC = {auc_h:.4f}")
-    print(f"  -> {unheard_lang} (Unheard) : EER = {eer_u*100:.2f}% | AUC = {auc_u:.4f}")
+    metrics_res = {}
+    if compute_dummy_metrics:
+        res_h = evaluate_model(model, face_h, voice_h, device)
+        res_u = evaluate_model(model, face_u, voice_u, device)
+        print(
+            f"    -> [Dummy Metric] {heard_lang}   : EER={res_h.eer*100:.2f}% (AUC={res_h.auc:.4f})"
+        )
+        print(
+            f"    -> [Dummy Metric] {unheard_lang} : EER={res_u.eer*100:.2f}% (AUC={res_u.auc:.4f})"
+        )
+        metrics_res[f"{track}_{heard_lang}_heard"] = (res_h.eer, res_h.legacy_eer)
+        metrics_res[f"{track}_{unheard_lang}_unheard"] = (res_u.eer, res_u.legacy_eer)
 
     return {
-        f"{track}_{heard_lang}_heard": eer_h,
-        f"{track}_{unheard_lang}_unheard": eer_u,
+        "trials_h": len(keys_h),
+        "trials_u": len(keys_u),
+        "metrics": metrics_res,
     }
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate Checkpoint")
+    parser = argparse.ArgumentParser(description="Generate Challenge Submissions")
     parser.add_argument(
         "--config",
         type=str,
@@ -141,41 +155,57 @@ if __name__ == "__main__":
         default=True,
         help="Create official submission.zip package",
     )
+    parser.add_argument(
+        "--compute_dummy_metrics",
+        action="store_true",
+        default=False,
+        help="Compute legacy dummy alternating metrics (not recommended)",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     tracks = ["no_gender", "gender"] if args.track == "all" else [args.track]
 
-    all_metrics = {}
+    all_res = {}
     for t in tracks:
         res = evaluate_and_generate_scores(
-            cfg, args.ckpt, track=t, heard_lang=args.heard_lang
+            cfg,
+            args.ckpt,
+            track=t,
+            heard_lang=args.heard_lang,
+            compute_dummy_metrics=args.compute_dummy_metrics,
         )
-        all_metrics.update(res)
+        all_res[t] = res
 
-    print(f"\n{'='*60}\nEVALUATION SUMMARY ({args.ckpt})\n{'='*60}")
-    print(f"{'Condition':<35}{'EER (%)'}")
-    print("-" * 50)
-    for cond, eer in all_metrics.items():
-        print(f"{cond:<35}{eer*100:.2f}%")
-    if len(all_metrics) == 4:
-        avg_eer = np.mean(list(all_metrics.values())) * 100
-        print("-" * 50)
-        print(f"{'Overall Average EER':<35}{avg_eer:.2f}%")
+    expected_files = [
+        "no_gender/sub_score_v4_English_heard.txt",
+        "no_gender/sub_score_v4_Bangla_unheard.txt",
+        "gender/sub_score_v4_English_heard.txt",
+        "gender/sub_score_v4_Bangla_unheard.txt",
+    ]
 
-    if args.create_zip and len(all_metrics) == 4:
+    print(f"\n{'='*75}\nSUBMISSION SUMMARY ({args.ckpt})\n{'='*75}")
+    print(f"{'Cell':<45}{'Status':<15}{'Trials'}")
+    print("-" * 75)
+    for rel in expected_files:
+        full = os.path.join("output", "sub_score_v4", rel)
+        status = "Ready" if os.path.exists(full) else "Missing"
+        lines = 0
+        if os.path.exists(full):
+            with open(full) as f:
+                lines = sum(1 for _ in f)
+        print(f"{rel:<45}{status:<15}{lines}")
+    print("-" * 75)
+
+    if args.create_zip and len(all_res) == 2:
         import zipfile
         zip_path = os.path.join("output", "submission.zip")
-        expected_files = [
-            "no_gender/sub_score_v4_English_heard.txt",
-            "no_gender/sub_score_v4_Bangla_unheard.txt",
-            "gender/sub_score_v4_English_heard.txt",
-            "gender/sub_score_v4_Bangla_unheard.txt",
-        ]
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for rel in expected_files:
                 full = os.path.join("output", "sub_score_v4", rel)
                 if os.path.exists(full):
                     zf.write(full, arcname=rel)
-        print(f"\n[Submission] Successfully packaged {zip_path}")
-        print("Ready to upload to the challenge submission portal!")
+        print(f"\n[Submission Package] Successfully created: {zip_path}")
+        print("Ready for upload to CodaLab / challenge submission portal!")
+        print("(Note: Official EER is computed on the challenge server because dev_set labels are held out.)\n")
+

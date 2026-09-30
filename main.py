@@ -8,7 +8,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from src.config import load_config
-from src.data import read_eval_data, read_train_data
+from src.data import read_train_data, make_local_val_split
 from src.evaluation import evaluate_model
 from src.losses import OrthogonalProjectionLoss
 from src.models import FOP
@@ -56,7 +56,16 @@ def train_epoch(
     return loss.item(), loss_opl.item(), loss_soft.item()
 
 
-def fit(face_train, voice_train, train_labels, face_test, voice_test, cfg):
+def fit(
+    tr_faces,
+    tr_voices,
+    tr_labels,
+    val_faces,
+    val_voices,
+    val_targets,
+    n_class,
+    cfg,
+):
     device = torch.device(
         "cuda" if cfg.model.cuda and torch.cuda.is_available() else "cpu"
     )
@@ -65,8 +74,7 @@ def fit(face_train, voice_train, train_labels, face_test, voice_test, cfg):
     os.makedirs(cfg.run.save_dir, exist_ok=True)
     os.makedirs("output", exist_ok=True)
 
-    n_samples = face_train.shape[0]
-    n_class = int(np.max(train_labels)) + 1
+    n_samples = tr_faces.shape[0]
     alphas = (
         cfg.train.alpha_list
         if isinstance(cfg.train.alpha_list, list)
@@ -85,7 +93,7 @@ def fit(face_train, voice_train, train_labels, face_test, voice_test, cfg):
         optimizer = torch.optim.Adam(
             model.parameters(),
             lr=cfg.train.lr,
-            weight_decay=getattr(cfg.train, "weight_decay", 0.01),
+            weight_decay=getattr(cfg.train, "weight_decay", 1e-4),
         )
         ce_loss = nn.CrossEntropyLoss().to(device)
         opl_loss = OrthogonalProjectionLoss(device).to(device)
@@ -98,9 +106,9 @@ def fit(face_train, voice_train, train_labels, face_test, voice_test, cfg):
         for epoch in range(1, cfg.train.max_num_epoch + 1):
             perm = np.random.permutation(n_samples)
             f_shuf, v_shuf, l_shuf = (
-                face_train[perm],
-                voice_train[perm],
-                train_labels[perm],
+                tr_faces[perm],
+                tr_voices[perm],
+                tr_labels[perm],
             )
 
             pbar = tqdm(
@@ -128,32 +136,55 @@ def fit(face_train, voice_train, train_labels, face_test, voice_test, cfg):
                     opl=f"{opl_l:.4f}",
                 )
 
-            val_eer, val_auc = evaluate_model(
-                model, face_test, voice_test, device
-            )
-            eer_history.append(val_eer)
-            print(
-                f"[Epoch {epoch:03d}] Val EER: {val_eer:.4f} | Val AUC: {val_auc:.4f}"
-            )
+            # Evaluate on genuine local validation set
+            if val_faces is not None and val_targets is not None:
+                val_res = evaluate_model(
+                    model, val_faces, val_voices, device, y_true=val_targets
+                )
+                val_eer, val_auc = val_res.eer, val_res.auc
+                eer_history.append(val_eer)
+                print(
+                    f"[Epoch {epoch:03d}] Local Val: EER={val_eer*100:.2f}%, AUC={val_auc:.4f} | "
+                    f"10-Fold: EER={val_res.legacy_eer*100:.2f}%, Acc={val_res.legacy_acc*100:.1f}%"
+                )
 
-            if val_eer + cfg.train.min_delta < best_eer:
-                best_eer = val_eer
-                best_epoch = epoch
-                patience_count = 0
+                if val_eer + cfg.train.min_delta < best_eer:
+                    best_eer = val_eer
+                    best_epoch = epoch
+                    patience_count = 0
+                    ckpt_path = os.path.join(
+                        cfg.run.save_dir,
+                        f"{cfg.model.fusion}_{cfg.run.tag}_{alpha:.2f}_best.pth.tar",
+                    )
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "state_dict": model.state_dict(),
+                            "eer": best_eer,
+                            "n_class": n_class,
+                        },
+                        ckpt_path,
+                    )
+                    print(f"  --> Saved new best checkpoint to {ckpt_path}")
+                else:
+                    patience_count += 1
+                    if patience_count >= cfg.train.patience:
+                        print(f"Early stopping triggered at epoch {epoch}")
+                        break
+            else:
+                # Full train mode: save periodically
                 ckpt_path = os.path.join(
                     cfg.run.save_dir,
                     f"{cfg.model.fusion}_{cfg.run.tag}_{alpha:.2f}_best.pth.tar",
                 )
                 torch.save(
-                    {"epoch": epoch, "state_dict": model.state_dict(), "eer": best_eer},
+                    {
+                        "epoch": epoch,
+                        "state_dict": model.state_dict(),
+                        "n_class": n_class,
+                    },
                     ckpt_path,
                 )
-                print(f"  --> Saved new best checkpoint to {ckpt_path}")
-            else:
-                patience_count += 1
-                if patience_count >= cfg.train.patience:
-                    print(f"Early stopping triggered at epoch {epoch}")
-                    break
 
         results.append((alpha, best_eer, best_epoch))
 
@@ -183,8 +214,33 @@ if __name__ == "__main__":
         torch.cuda.manual_seed(cfg.run.seed)
 
     face_train, voice_train, train_labels = read_train_data(cfg)
-    face_test, voice_test = read_eval_data(
-        cfg, track="no_gender", language="Bangla"
+
+    n_val_speakers = getattr(cfg.train, "val_speakers", 10)
+    (tr_faces, tr_voices, tr_labels, n_class), (val_faces, val_voices, val_targets) = make_local_val_split(
+        face_train,
+        voice_train,
+        train_labels,
+        n_val_speakers=n_val_speakers,
+        seed=cfg.run.seed,
     )
 
-    fit(face_train, voice_train, train_labels, face_test, voice_test, cfg)
+    if val_faces is not None:
+        n_pos = int(np.sum(val_targets == 1))
+        n_neg = int(np.sum(val_targets == 0))
+        print(
+            f"  [Validation] Open-set split: {len(val_targets)} pairs ({n_pos} pos, {n_neg} neg) from {n_val_speakers} held-out speakers"
+        )
+    else:
+        print("  [Validation] None (training on 100% of available samples)")
+
+    fit(
+        tr_faces,
+        tr_voices,
+        tr_labels,
+        val_faces,
+        val_voices,
+        val_targets,
+        n_class,
+        cfg,
+    )
+

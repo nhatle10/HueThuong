@@ -49,3 +49,65 @@ def read_eval_data(cfg, track: str = "no_gender", language: str = "Bangla"):
     face_test = torch.from_numpy(face_test).float()
     voice_test = torch.from_numpy(voice_test).float()
     return face_test, voice_test
+
+
+def make_local_val_split(
+    face_train: np.ndarray,
+    voice_train: np.ndarray,
+    labels_train: np.ndarray,
+    n_val_speakers: int = 10,
+    seed: int = 42,
+):
+    """
+    Creates an open-set validation split from the training dataset.
+    Holds out `n_val_speakers` to form genuine 1:1 matching and non-matching verification pairs.
+    
+    Returns:
+        (tr_faces, tr_voices, tr_labels, n_tr_classes), (val_faces, val_voices, val_targets)
+    """
+    if n_val_speakers <= 0:
+        n_classes = int(np.max(labels_train)) + 1
+        return (face_train, voice_train, labels_train, n_classes), (None, None, None)
+
+    unique_speakers = np.unique(labels_train)
+    rng = np.random.default_rng(seed)
+    shuffled_spks = rng.permutation(unique_speakers)
+
+    val_spks = set(shuffled_spks[:n_val_speakers])
+    tr_spks = sorted(list(set(shuffled_spks[n_val_speakers:])))
+    spk_to_new_id = {s: i for i, s in enumerate(tr_spks)}
+
+    tr_mask = np.isin(labels_train, tr_spks)
+    val_mask = np.isin(labels_train, list(val_spks))
+
+    tr_faces = face_train[tr_mask]
+    tr_voices = voice_train[tr_mask]
+    tr_labels = np.array([spk_to_new_id[l] for l in labels_train[tr_mask]])
+
+    v_faces = face_train[val_mask]
+    v_voices = voice_train[val_mask]
+    v_labels = labels_train[val_mask]
+
+    # Positive pairs: face and voice from same sample
+    pos_faces = v_faces
+    pos_voices = v_voices
+    pos_targets = np.ones(len(pos_faces), dtype=int)
+
+    # Negative pairs: mismatched face and voice from different speakers
+    neg_voices = []
+    for i, l in enumerate(v_labels):
+        diff_idx = np.where(v_labels != l)[0]
+        chosen = rng.choice(diff_idx)
+        neg_voices.append(v_voices[chosen])
+    neg_voices = np.array(neg_voices)
+    neg_targets = np.zeros(len(v_faces), dtype=int)
+
+    val_f = np.vstack([pos_faces, v_faces])
+    val_v = np.vstack([pos_voices, neg_voices])
+    val_targets = np.concatenate([pos_targets, neg_targets])
+
+    val_f = torch.from_numpy(val_f).float()
+    val_v = torch.from_numpy(val_v).float()
+
+    return (tr_faces, tr_voices, tr_labels, len(tr_spks)), (val_f, val_v, val_targets)
+

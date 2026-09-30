@@ -120,24 +120,41 @@ The baseline is a two-branch network over pre-extracted face and voice embedding
 ## Submission Platform
 Participants will submit their predictions through the [CodaBench](https://www.codabench.org/competitions/18062/) platform, where their performance will be automatically evaluated and scored.
 
+## Quickstart: Training & Submission
+
+### 1. Train the Baseline Model
+```bash
+python main.py --config configs/baseline.yaml
+```
+- Trains the FOP dual-branch network with cross-entropy and Orthogonal Projection Loss (OPL).
+- Automatically creates an open-set local validation split (10 unseen speakers) and evaluates true verification EER every epoch.
+- Saves the best checkpoint to `output/checkpoints/gated_english_2.00_best.pth.tar`.
+
+### 2. Generate CodaBench / Challenge Submission
+```bash
+python evaluate.py --config configs/baseline.yaml --ckpt output/checkpoints/gated_english_2.00_best.pth.tar
+```
+- Evaluates across all 4 competition tracks (`no_gender/English_heard`, `no_gender/Bangla_unheard`, `gender/English_heard`, `gender/Bangla_unheard`).
+- Automatically bundles all four score files into `output/submission.zip`.
+- Upload `output/submission.zip` directly to [CodaBench Competition #18062](https://www.codabench.org/competitions/18062/).
+
 ## Hierarchy
 
 ```
 .
-├── challenge/
-│   └── eval_submission.py            # scores a submission file against ground truth
-├── feature_extraction/
-│   ├── backbone.py
-│   ├── extract_face_features.py      # VGGFace embeddings from face crops
-│   ├── extract_voice_features_ecapa.py
-│   ├── model.py
-│   └── utils.py
-├── computeScore.py                   # EER computation
-├── main.py                           # training entry point
-├── online_evaluation.py              # evaluation during training
-├── retrieval_model.py                # two-branch fusion model
-└── test.py                           # inference / score-file generation
+├── configs/
+│   └── baseline.yaml                 # Centralized configuration (paths, hyperparameters, etc.)
+├── src/
+│   ├── data/                         # Data loading & open-set local validation splitting
+│   ├── models/                       # FOP model architecture (Dual-branch & Gated Fusion)
+│   ├── losses/                       # Orthogonal Projection Loss (OPL)
+│   ├── evaluation/                   # Evaluation metrics (Challenge EER/AUC + Stratified 10-Fold)
+│   └── config.py                     # YAML configuration loader
+├── legacy/                           # Preserved original baseline reference scripts
+├── main.py                           # Training entry point
+└── evaluate.py                       # Inference & CodaBench submission packaging
 ```
+
 
 
 ## Setup

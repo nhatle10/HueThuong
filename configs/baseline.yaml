@@ -27,9 +27,10 @@ model:
   cuda: true
 train:
   batch_size: 128
-  lr: 0.00001
-  weight_decay: 0.01
+  lr: 0.0001
+  weight_decay: 0.0001
   max_num_epoch: 200
   patience: 20
   min_delta: 0.0005
   alpha_list: [2.0]     # Weight for OPL loss
+  val_speakers: 10      # Number of unseen speakers for local validation (0 = train on all)

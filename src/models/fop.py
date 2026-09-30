@@ -3,53 +3,66 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class EmbedBranch(nn.Module):
-    def __init__(self, feat_dim, dim_embed):
-        super(EmbedBranch, self).__init__()
-        self.fc1 = nn.Linear(feat_dim, dim_embed)
-        self.bn1 = nn.BatchNorm1d(dim_embed)
-        self.relu = nn.ReLU()
+def make_fc_1d(f_in, f_out):
+    return nn.Sequential(
+        nn.Linear(f_in, f_out),
+        nn.BatchNorm1d(f_out),
+        nn.ReLU(inplace=True),
+        nn.Dropout(p=0.5),
+    )
+
+
+class ForwardBlock(nn.Module):
+    def __init__(self, in_dim=128, out_dim=128, p_val=0.0):
+        super(ForwardBlock, self).__init__()
+        self.block = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.BatchNorm1d(out_dim),
+            nn.ReLU(),
+            nn.Dropout(p=p_val),
+        )
 
     def forward(self, x):
-        x = self.relu(self.bn1(self.fc1(x)))
-        return x
+        return self.block(x)
 
 
 class LinearWeightedAvg(nn.Module):
-    def __init__(self, n_inputs, n_features):
+    def __init__(self):
         super(LinearWeightedAvg, self).__init__()
-        self.weights = nn.ParameterList(
-            [nn.Parameter(torch.randn(1)) for _ in range(n_inputs)]
-        )
-        self.bn = nn.BatchNorm1d(n_features)
+        self.w1 = nn.Parameter(torch.rand(1))
+        self.w2 = nn.Parameter(torch.rand(1))
 
-    def forward(self, input_list):
-        res = 0
-        for i, weight in enumerate(self.weights):
-            res += input_list[i] * weight
-        return self.bn(res)
+    def forward(self, face_feat, voice_feat):
+        fused = self.w1 * face_feat + self.w2 * voice_feat
+        return fused, face_feat, voice_feat
 
 
 class GatedFusion(nn.Module):
-    def __init__(
-        self,
-        dim_face,
-        dim_voice,
-        dim_face_embed,
-        dim_voice_embed,
-        dim_fused_embed,
-    ):
+    def __init__(self, embed_dim=128, mid_att_dim=128):
         super(GatedFusion, self).__init__()
-        self.fc1 = nn.Linear(dim_face + dim_voice, 2)
-        self.bn1 = nn.BatchNorm1d(dim_fused_embed)
-
-    def forward(self, face, voice, face_embed, voice_embed):
-        features = torch.cat((face, voice), dim=1)
-        z = F.sigmoid(self.fc1(features))
-        fused = (z[:, 0].unsqueeze(1) * face_embed) + (
-            z[:, 1].unsqueeze(1) * voice_embed
+        self.attention = nn.Sequential(
+            ForwardBlock(embed_dim * 2, mid_att_dim),
+            nn.Linear(mid_att_dim, embed_dim),
         )
-        return self.bn1(fused)
+
+    def forward(self, face_embed, voice_embed):
+        concat = torch.cat((face_embed, voice_embed), dim=1)
+        att = torch.sigmoid(self.attention(concat))
+        face_trans = torch.tanh(face_embed)
+        voice_trans = torch.tanh(voice_embed)
+        fused = face_trans * att + (1.0 - att) * voice_trans
+        return fused, face_embed, voice_embed
+
+
+class EmbedBranch(nn.Module):
+    def __init__(self, feat_dim, dim_embed):
+        super(EmbedBranch, self).__init__()
+        self.fc1 = make_fc_1d(feat_dim, dim_embed)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = F.normalize(x, p=2, dim=1)
+        return x
 
 
 class FOP(nn.Module):
@@ -62,33 +75,24 @@ class FOP(nn.Module):
         self.face_branch = EmbedBranch(face_feat_dim, self.dim_embed)
 
         if self.fusion == "linear":
-            self.fusion_layer = LinearWeightedAvg(self.dim_embed, self.dim_embed)
+            self.fusion_layer = LinearWeightedAvg()
         elif self.fusion == "gated":
-            self.fusion_layer = GatedFusion(
-                face_feat_dim,
-                voice_feat_dim,
-                self.dim_embed,
-                128,
-                self.dim_embed,
-            )
+            self.fusion_layer = GatedFusion(self.dim_embed, 128)
+        else:
+            raise ValueError(f"Unknown fusion type: {self.fusion}")
 
         self.logits_layer = nn.Linear(self.dim_embed, n_class)
 
     def forward(self, faces, voices):
-        face_embeds = self.face_branch(faces)
         voice_embeds = self.voice_branch(voices)
-
-        if self.fusion == "linear":
-            fused_embeds = self.fusion_layer([face_embeds, voice_embeds])
-        elif self.fusion == "gated":
-            fused_embeds = self.fusion_layer(
-                faces, voices, face_embeds, voice_embeds
-            )
-
-        return fused_embeds, face_embeds, voice_embeds
+        face_embeds = self.face_branch(faces)
+        fused, face_embeds, voice_embeds = self.fusion_layer(
+            face_embeds, voice_embeds
+        )
+        return fused, face_embeds, voice_embeds
 
     def train_forward(self, faces, voices, labels):
-        fused_embeds, face_embeds, voice_embeds = self.forward(faces, voices)
-        logits = self.logits_layer(fused_embeds)
-        comb = [fused_embeds, logits]
+        fused, face_embeds, voice_embeds = self.forward(faces, voices)
+        logits = self.logits_layer(fused)
+        comb = [fused, logits]
         return comb, face_embeds, voice_embeds

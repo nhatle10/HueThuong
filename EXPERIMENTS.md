@@ -14,10 +14,10 @@ Internal log for tracking experimental runs, model iterations, and validation sc
 3. **How to run & evaluate**:
    ```bash
    # 1. Train
-   .venv/bin/python main.py --config configs/expXX.yaml
+   python main.py --config configs/expXX.yaml
 
-   # 2. Generate scores
-   .venv/bin/python computeScore.py --config configs/expXX.yaml --ckpt output/checkpoints/<exp_dir>/checkpoint_best.pth.tar --track all
+   # 2. Generate CodaBench submission package
+   python evaluate.py --config configs/expXX.yaml --ckpt output/checkpoints/<ckpt_name>.pth.tar
    ```
 4. **Record the result in the table below before merging or switching branches**.
 
@@ -26,10 +26,11 @@ Internal log for tracking experimental runs, model iterations, and validation sc
 ## Results
 
 > **Goal**: Lower Equal Error Rate (EER %) is better.  
-> Target: Beat the official baseline overall score of **36.92%**.
+> Target: Beat our reproduced baseline overall score of **33.20%**.
 
 | Run ID | Date | Author | Branch / Commit | Backbones | Loss / Technique | Eng (Std) EER | Bangla (Std) EER | Eng (Gender) EER | Bangla (Gender) EER | Overall EER ↓ | Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **EXP-00** | 2026-09-29 | Baseline | `main` | VGGFace + ECAPA | FOP (OPL + CE) | 32.54% | 38.12% | 32.99% | 44.01% | **36.92%** | Official paper baseline. Huge drop on gender-controlled Bangla. |
-| **EXP-01** | *YYYY-MM-DD* | *Name* | `main` | XXXX-XXXX | XXXX | - | - | - | - | **-** | First local reproduction run. |
-| **EXP-XX** | | | | | | | | | | | |
+| **EXP-00a** | 2026-09-29 | Paper Ref | `main` | VGGFace + ECAPA | FOP (OPL + CE) | 32.54% | 38.12% | 32.99% | 44.01% | **36.92%** | Official paper reported baseline. |
+| **EXP-00b** | 2026-09-30 | Team | `main` | VGGFace + ECAPA | FOP (OPL + CE, lr=1e-4) | - | - | - | - | **33.20%** | **Official CodaBench Submission #953716**. Full convergence baseline. |
+| **EXP-01** | *YYYY-MM-DD* | *Name* | `exp/infonce-loss` | VGGFace + ECAPA | Symmetric InfoNCE Loss | - | - | - | - | **-** | First loss improvement experiment. |
+
