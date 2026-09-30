@@ -16,7 +16,9 @@ track = 'no_gender'                     # CHANGED (v4): 'no_gender' or 'gender'
 cond = 'unheard'                          # CHANGED (v4): 'heard' or 'unheard'
                                         #   heard   -> model trained on test_lang
                                         #   unheard -> model trained on the other language
-SCORE_ROOT = '/home/swapnilkhandoker/Bachelor_Thesis/project/utils/stage7_feature_extraction/mavceleb_baseline/sub_score_v4'   # CHANGED (v4)
+import os
+
+SCORE_ROOT = os.environ.get('SCORE_ROOT', 'output/sub_score_v4')
 
 # Read scores submitted by participant 'participantID_version_trainlang_testlang.txt'
 sub_results = {}
