@@ -31,6 +31,5 @@ Internal log for tracking experimental runs, model iterations, and validation sc
 | Run ID | Date | Author | Branch / Commit | Backbones | Loss / Technique | Eng (Std) EER | Bangla (Std) EER | Eng (Gender) EER | Bangla (Gender) EER | Overall EER ↓ | Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
 | **EXP-00a** | 2026-09-29 | Paper Ref | `main` | VGGFace + ECAPA | FOP (OPL + CE) | 32.54% | 38.12% | 32.99% | 44.01% | **36.92%** | Official paper reported baseline. |
-| **EXP-00b** | 2026-09-30 | Team | `main` | VGGFace + ECAPA | FOP (OPL + CE, lr=1e-4) | - | - | - | - | **33.20%** | **Official CodaBench Submission #953716**. Full convergence baseline. |
-| **EXP-01** | *YYYY-MM-DD* | *Name* | `exp/infonce-loss` | VGGFace + ECAPA | Symmetric InfoNCE Loss | - | - | - | - | **-** | First loss improvement experiment. |
-
+| **EXP-00b** | 2026-09-30 | Team | `main` | VGGFace + ECAPA | FOP (OPL + CE, lr=1e-4) | 28.57% | 28.59% | 33.40% | 42.23% | **33.20%** | **Official Submission #953716**. Full convergence baseline. |
+| **EXP-01** | 2026-10-01 | Team | `exp/paeff-alignment` | VGGFace + ECAPA | PAEFF (EGFF + Poincaré Alignment) | 28.17% | 31.15% | 32.18% | 42.10% | **33.40%** | **Official Submission #955103**. Local Val: 16.67%. Beat baseline on 3/4 tracks (notably Eng Gender 33.40% → 32.18%). |

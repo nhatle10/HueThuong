@@ -10,7 +10,7 @@ from tqdm import tqdm
 from src.config import load_config
 from src.data import read_train_data, make_local_val_split
 from src.evaluation import evaluate_model
-from src.losses import OrthogonalProjectionLoss
+from src.losses import OrthogonalProjectionLoss, PreciseAlignmentLoss
 from src.models import FOP
 
 
@@ -34,9 +34,8 @@ def train_epoch(
     labels,
     model,
     optimizer,
-    ce_loss,
-    opl_loss,
-    alpha,
+    losses,
+    weights,
     device,
 ):
     model.train()
@@ -44,17 +43,30 @@ def train_epoch(
     voice_feats = torch.from_numpy(voice_feats).float().to(device)
     labels = torch.from_numpy(labels).to(device)
 
-    comb, _, _ = model.train_forward(face_feats, voice_feats, labels)
-    loss_opl, _, _ = opl_loss(comb[0], labels)
-    loss_soft = ce_loss(comb[1], labels)
-    loss = loss_soft + alpha * loss_opl
+    comb, face_embeds, voice_embeds = model.train_forward(face_feats, voice_feats, labels)
+
+    # [1] Get base losses
+    loss_opl, _, _ = losses["opl"](comb[0], labels)
+    loss_soft = losses["ce"](comb[1], labels)
+
+    alpha_ce = weights.get("alpha_ce", 1.0)
+    alpha_opl = weights.get("alpha_opl", 1.0)
+    alpha_align = weights.get("alpha_align", 0.0)
+
+    loss = alpha_ce * loss_soft + alpha_opl * loss_opl
+    align_val = 0.0
+
+    # [2] Alignment loss (if present in losses dict and weight > 0)
+    if "align" in losses and losses["align"] is not None and alpha_align > 0:
+        loss_align = losses["align"](face_embeds, voice_embeds)
+        loss = loss + alpha_align * loss_align
+        align_val = loss_align.item()
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    return loss.item(), loss_opl.item(), loss_soft.item()
-
+    return loss.item(), loss_opl.item(), loss_soft.item(), align_val
 
 def fit(
     tr_faces,
@@ -75,11 +87,14 @@ def fit(
     os.makedirs("output", exist_ok=True)
 
     n_samples = tr_faces.shape[0]
-    alphas = (
-        cfg.train.alpha_list
-        if isinstance(cfg.train.alpha_list, list)
-        else [float(cfg.train.alpha_list)]
-    )
+
+    alphas = getattr(cfg.train, "alpha_list", None)
+    if alphas is None:
+        alphas = [getattr(cfg.train, "alpha_opl", 1.0)]
+    elif not isinstance(alphas, list):
+        alphas = [float(alphas)]
+
+
 
     results = []
     for alpha in alphas:
@@ -95,8 +110,21 @@ def fit(
             lr=cfg.train.lr,
             weight_decay=getattr(cfg.train, "weight_decay", 1e-4),
         )
-        ce_loss = nn.CrossEntropyLoss().to(device)
-        opl_loss = OrthogonalProjectionLoss(device).to(device)
+        losses = {
+            "ce": nn.CrossEntropyLoss().to(device),
+            "opl": OrthogonalProjectionLoss(device).to(device),
+            "align": (
+                PreciseAlignmentLoss(temperature=getattr(cfg.train, "temperature", 0.07)).to(device)
+                if getattr(cfg.train, "alpha_align", 0.0) > 0
+                else None
+            ),
+        }
+
+        weights = {
+            "alpha_ce": getattr(cfg.train, "alpha_ce", 1.0),
+            "alpha_opl": getattr(cfg.train, "alpha_opl", alpha),
+            "alpha_align": getattr(cfg.train, "alpha_align", 0.0),
+        }
 
         best_eer = float("inf")
         best_epoch = 0
@@ -119,21 +147,21 @@ def fit(
                 fb = f_shuf[i : i + cfg.train.batch_size]
                 vb = v_shuf[i : i + cfg.train.batch_size]
                 lb = l_shuf[i : i + cfg.train.batch_size]
-                total_l, opl_l, ce_l = train_epoch(
+                total_l, opl_l, ce_l, align_l = train_epoch(
                     fb,
                     vb,
                     lb,
                     model,
                     optimizer,
-                    ce_loss,
-                    opl_loss,
-                    alpha,
+                    losses,
+                    weights,
                     device,
                 )
                 pbar.set_postfix(
                     loss=f"{total_l:.4f}",
                     ce=f"{ce_l:.4f}",
                     opl=f"{opl_l:.4f}",
+                    align=f"{align_l:.4f}",
                 )
 
             # Evaluate on genuine local validation set
