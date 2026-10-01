@@ -3,15 +3,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def make_fc_1d(f_in, f_out):
-    return nn.Sequential(
+def make_fc_1d(f_in: int, f_out: int, n_layers: int = 1, dropout: float = 0.5):
+    layers = [
         nn.Linear(f_in, f_out),
         nn.BatchNorm1d(f_out),
         nn.ReLU(inplace=True),
-        nn.Dropout(p=0.5),
-    )
+        nn.Dropout(p=dropout),
+    ]
 
+    # For any intermediate layers
+    for _ in range(n_layers - 2):
+        layers.extend([
+            nn.Linear(f_out, f_out),
+            nn.BatchNorm1d(f_out),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+        ])
 
+    # Final projection layer
+    if n_layers > 1:
+        layers.append(nn.Linear(f_out, f_out))
+
+    return nn.Sequential(*layers)
 class ForwardBlock(nn.Module):
     def __init__(self, in_dim=128, out_dim=128, p_val=0.0):
         super(ForwardBlock, self).__init__()
@@ -52,17 +65,15 @@ class GatedFusion(nn.Module):
         voice_trans = torch.tanh(voice_embed)
         fused = face_trans * att + (1.0 - att) * voice_trans
         return fused, face_embed, voice_embed
-
-
 class EmbedBranch(nn.Module):
-    def __init__(self, feat_dim, dim_embed):
+    def __init__(self, feat_dim: int, dim_embed: int, n_layers: int = 1, dropout: float = 0.5):
         super(EmbedBranch, self).__init__()
-        self.fc1 = make_fc_1d(feat_dim, dim_embed)
-
+        self.fc1 = make_fc_1d(feat_dim, dim_embed, n_layers=n_layers, dropout=dropout)
     def forward(self, x):
         x = self.fc1(x)
         x = F.normalize(x, p=2, dim=1)
         return x
+
 class EnhancedGatedFusion(nn.Module):
     """
     Enhanced Gate Feature Fusion (EGFF) from PAEFF.
@@ -94,8 +105,11 @@ class FOP(nn.Module):
         self.dim_embed = model_cfg.dim_embed
         self.fusion = model_cfg.fusion
 
-        self.voice_branch = EmbedBranch(voice_feat_dim, self.dim_embed)
-        self.face_branch = EmbedBranch(face_feat_dim, self.dim_embed)
+        n_layers = getattr(model_cfg, "n_layers", 1)
+        dropout = getattr(model_cfg, "dropout", 0.5)
+
+        self.voice_branch = EmbedBranch(voice_feat_dim, self.dim_embed, n_layers=n_layers, dropout=dropout)
+        self.face_branch = EmbedBranch(face_feat_dim, self.dim_embed, n_layers=n_layers, dropout=dropout)
 
         if self.fusion == "linear":
             self.fusion_layer = LinearWeightedAvg()

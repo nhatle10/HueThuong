@@ -68,6 +68,52 @@ def train_epoch(
 
     return loss.item(), loss_opl.item(), loss_soft.item(), align_val
 
+
+def save_training_plots(history, save_dir, run_name):
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    epochs = range(1, len(history["loss"]) + 1)
+
+    # Subplot 1: Losses
+    axes[0].plot(epochs, history["loss"], label="Total Loss", color="black", linewidth=2)
+    axes[0].plot(epochs, history["ce"], label="Cross-Entropy", linestyle="--")
+    axes[0].plot(epochs, history["opl"], label="OPL", linestyle="--")
+    if any(a > 0 for a in history.get("align", [])):
+        axes[0].plot(epochs, history["align"], label="Alignment", linestyle="--")
+    axes[0].set_title(f"Training Losses ({run_name})")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    # Subplot 2: Validation Metrics
+    if history.get("val_eer") and len(history["val_eer"]) > 0:
+        val_epochs = range(1, len(history["val_eer"]) + 1)
+        axes[1].plot(val_epochs, history["val_eer"], label="Val EER (%)", color="crimson", linewidth=2)
+        best_idx = int(np.argmin(history["val_eer"]))
+        best_val = history["val_eer"][best_idx]
+        axes[1].scatter(
+            best_idx + 1,
+            best_val,
+            color="blue",
+            s=100,
+            zorder=5,
+            label=f"Best: {best_val:.2f}% (Epoch {best_idx+1})",
+        )
+        axes[1].set_title("Open-Set Validation EER")
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("EER (%)")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    os.makedirs(save_dir, exist_ok=True)
+    plot_path = os.path.join(save_dir, f"{run_name}_curves.png")
+    plt.savefig(plot_path, dpi=200)
+    plt.close()
+    print(f"\n  --> Saved training curves plot to {plot_path}")
+
+
 def fit(
     tr_faces,
     tr_voices,
@@ -130,6 +176,14 @@ def fit(
         best_epoch = 0
         patience_count = 0
         eer_history = []
+        history = {
+            "loss": [],
+            "ce": [],
+            "opl": [],
+            "align": [],
+            "val_eer": [],
+            "val_auc": [],
+        }
 
         for epoch in range(1, cfg.train.max_num_epoch + 1):
             perm = np.random.permutation(n_samples)
@@ -143,6 +197,7 @@ def fit(
                 range(0, n_samples, cfg.train.batch_size),
                 desc=f"Epoch {epoch}/{cfg.train.max_num_epoch}",
             )
+            ep_loss, ep_ce, ep_opl, ep_align, n_batches = 0.0, 0.0, 0.0, 0.0, 0
             for i in pbar:
                 fb = f_shuf[i : i + cfg.train.batch_size]
                 vb = v_shuf[i : i + cfg.train.batch_size]
@@ -157,12 +212,22 @@ def fit(
                     weights,
                     device,
                 )
+                ep_loss += total_l
+                ep_ce += ce_l
+                ep_opl += opl_l
+                ep_align += align_l
+                n_batches += 1
                 pbar.set_postfix(
                     loss=f"{total_l:.4f}",
                     ce=f"{ce_l:.4f}",
                     opl=f"{opl_l:.4f}",
                     align=f"{align_l:.4f}",
                 )
+
+            history["loss"].append(ep_loss / max(1, n_batches))
+            history["ce"].append(ep_ce / max(1, n_batches))
+            history["opl"].append(ep_opl / max(1, n_batches))
+            history["align"].append(ep_align / max(1, n_batches))
 
             # Evaluate on genuine local validation set
             if val_faces is not None and val_targets is not None:
@@ -171,6 +236,8 @@ def fit(
                 )
                 val_eer, val_auc = val_res.eer, val_res.auc
                 eer_history.append(val_eer)
+                history["val_eer"].append(val_eer * 100.0)
+                history["val_auc"].append(val_auc)
                 print(
                     f"[Epoch {epoch:03d}] Local Val: EER={val_eer*100:.2f}%, AUC={val_auc:.4f} | "
                     f"10-Fold: EER={val_res.legacy_eer*100:.2f}%, Acc={val_res.legacy_acc*100:.1f}%"
@@ -214,6 +281,7 @@ def fit(
                     ckpt_path,
                 )
 
+        save_training_plots(history, "output", f"{cfg.run.name}_{cfg.model.fusion}_{alpha:.2f}")
         results.append((alpha, best_eer, best_epoch))
 
     print(f"\n{'='*50}\nSUMMARY ({cfg.run.tag})\n{'='*50}")
