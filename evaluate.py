@@ -17,7 +17,7 @@ def read_test_pair_features(face_path, voice_path, face_dim=4096, voice_dim=192)
 
 def evaluate_and_generate_scores(
     cfg,
-    ckpt_path,
+    ckpt_paths,
     track="no_gender",
     heard_lang="English",
     compute_dummy_metrics=False,
@@ -55,31 +55,24 @@ def evaluate_and_generate_scores(
         face_u_path, voice_u_path, face_dim, voice_dim
     )
 
-    # 2. Build model and load weights
-    checkpoint = torch.load(
-        ckpt_path, weights_only=False, map_location=device
-    )
-    n_class = (
-        checkpoint.get("n_class", 70) if isinstance(checkpoint, dict) else 70
-    )
-    model = FOP(cfg.model, face_dim, voice_dim, n_class).to(device)
-    state_dict = (
-        checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
-    )
-    model.load_state_dict(state_dict)
-    model.eval()
+    if isinstance(ckpt_paths, str):
+        ckpt_paths = [ckpt_paths]
 
-    # 3. Predict L2 distance scores
-    with torch.no_grad():
-        _, f_h_emb, v_h_emb = model(face_h.to(device), voice_h.to(device))
-        _, f_u_emb, v_u_emb = model(face_u.to(device), voice_u.to(device))
-
-        scores_h = np.linalg.norm(
-            f_h_emb.cpu().numpy() - v_h_emb.cpu().numpy(), axis=1
-        )
-        scores_u = np.linalg.norm(
-            f_u_emb.cpu().numpy() - v_u_emb.cpu().numpy(), axis=1
-        )
+    all_h, all_u = [], []
+    for ckpt_path in ckpt_paths:
+        checkpoint = torch.load(ckpt_path, weights_only=False, map_location=device)
+        n_class = checkpoint.get("n_class", 70) if isinstance(checkpoint, dict) else 70
+        model = FOP(cfg.model, face_dim, voice_dim, n_class).to(device)
+        state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+        model.load_state_dict(state_dict)
+        model.eval()
+        with torch.no_grad():
+            _, f_h_emb, v_h_emb = model(face_h.to(device), voice_h.to(device))
+            _, f_u_emb, v_u_emb = model(face_u.to(device), voice_u.to(device))
+            all_h.append(np.linalg.norm(f_h_emb.cpu().numpy() - v_h_emb.cpu().numpy(), axis=1))
+            all_u.append(np.linalg.norm(f_u_emb.cpu().numpy() - v_u_emb.cpu().numpy(), axis=1))
+    scores_h = np.mean(all_h, axis=0)
+    scores_u = np.mean(all_u, axis=0)
 
     # 4. Read pair keys
     key_h_path = os.path.join(dev_root, track, f"{heard_lang}_test.txt")
@@ -108,6 +101,8 @@ def evaluate_and_generate_scores(
 
     metrics_res = {}
     if compute_dummy_metrics:
+        if len(ckpt_paths) > 1:
+            raise ValueError("--compute_dummy_metrics supports a single checkpoint only")
         res_h = evaluate_model(model, face_h, voice_h, device)
         res_u = evaluate_model(model, face_u, voice_u, device)
         print(
@@ -134,9 +129,9 @@ if __name__ == "__main__":
         default="configs/baseline.yaml",
         help="Path to YAML config",
     )
-    parser.add_argument(
-        "--ckpt", type=str, required=True, help="Path to checkpoint (.pth.tar)"
-    )
+    parser.add_argument("--ckpt", type=str, nargs="+", required=True,
+                        help="Checkpoint path(s); multiple are score-averaged")
+
     parser.add_argument(
         "--track",
         type=str,
@@ -183,8 +178,9 @@ if __name__ == "__main__":
         "gender/sub_score_v4_English_heard.txt",
         "gender/sub_score_v4_Bangla_unheard.txt",
     ]
-
-    print(f"\n{'='*75}\nSUBMISSION SUMMARY ({args.ckpt})\n{'='*75}")
+    
+    ckpt_str = "+".join(args.ckpt)
+    print(f"\n{'='*75}\nSUBMISSION SUMMARY ({ckpt_str})\n{'='*75}")
     print(f"{'Cell':<45}{'Status':<15}{'Trials'}")
     print("-" * 75)
     for rel in expected_files:

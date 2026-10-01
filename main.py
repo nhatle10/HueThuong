@@ -15,7 +15,6 @@ from src.models import FOP
 
 
 class RunningAverage:
-
     def __init__(self):
         self.steps = 0
         self.total = 0
@@ -293,6 +292,13 @@ def fit(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Face-Voice Retrieval Model")
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Override model-init seed (ensemble member). The local val split "
+        "stays fixed on run.split_seed (default: run.seed in the config).",
+    )
+    parser.add_argument(
         "--config",
         type=str,
         default="configs/baseline.yaml",
@@ -301,6 +307,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    # Val split seed is decoupled from init seed so ensemble members share one split
+    split_seed = getattr(cfg.run, "split_seed", cfg.run.seed)
+    if args.seed is not None:
+        cfg.run.seed = args.seed
+        cfg.run.tag = f"{cfg.run.tag}_s{args.seed}"
+        cfg.run.name = f"{cfg.run.name}_s{args.seed}"
 
     # Set seeds
     torch.manual_seed(cfg.run.seed)
@@ -317,7 +329,7 @@ if __name__ == "__main__":
         voice_train,
         train_labels,
         n_val_speakers=n_val_speakers,
-        seed=cfg.run.seed,
+        seed=split_seed,
     )
 
     if val_faces is not None:
