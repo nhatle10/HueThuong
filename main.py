@@ -335,7 +335,7 @@ if __name__ == "__main__":
     face_train, voice_train, train_labels = read_train_data(cfg)
 
     n_val_speakers = getattr(cfg.train, "val_speakers", 10)
-    genders = read_class_genders(cfg.data.train.meta_csv, int(train_labels.max()) + 1)
+    genders = read_class_genders(cfg.data.train.meta_csv, int(train_labels.max()) + 1, getattr(cfg.data.train, "train_list", None))
     (tr_faces, tr_voices, tr_labels, n_class, tr_genders), (val_faces, val_voices, val_targets) = make_local_val_split(
         face_train, voice_train, train_labels,
         n_val_speakers=n_val_speakers,

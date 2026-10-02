@@ -122,16 +122,23 @@ def make_local_val_split(
 
     return (tr_faces, tr_voices, tr_labels, len(tr_spks), tr_genders), (val_f, val_v, val_targets)
 
-# LEGACY (EXP-04, negative result): only needed for gender batching / gender-matched val.
-def read_class_genders(meta_csv: str, n_classes: int) -> np.ndarray:
+# Only needed for gender batching / gender-matched val (EXP-04b).
+def read_class_genders(meta_csv: str, n_classes: int, train_list: str | None = None) -> np.ndarray:
     """
-    Gender per original class id (0..n-1): 0 = female, 1 = male.
-    Assumes row k <-> label k.
+    Gender per class id (0..n-1): 0 = female, 1 = male.
+    Class ids are NOT meta row order: they come from the train list (field 5 = speaker id,
+    field 6 = class id), so map id -> class through that file. EXP-04 assumed row k <-> class k,
+    which mislabels 34/70 speakers.
     """
+    if train_list is None:
+        train_list = os.path.join(
+            os.path.dirname(meta_csv), "train_set_extracted", "train_set", "train_set", "train_English.txt"
+        )
     meta = pd.read_csv(meta_csv, header=None)
-    expected = [f"id{k + 1:03d}" for k in range(len(meta))]
-    
-    assert list(meta[0]) == expected, "meta ids not in label order; fix the mapping"
-    assert len(meta) >= n_classes
-
-    return (meta[1].str.strip().str.lower() == "m").astype(int).values
+    gender_of = dict(zip(meta[0], meta[1].str.strip().str.lower() == "m"))
+    lst = pd.read_csv(train_list, sep=r"\s+", header=None)
+    genders = np.full(n_classes, -1)
+    for spk, label in zip(lst[4], lst[5]):
+        genders[int(label)] = int(gender_of[spk])
+    assert (genders >= 0).all(), "some class ids have no gender in the train list"
+    return genders
