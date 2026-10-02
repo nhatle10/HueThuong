@@ -15,6 +15,20 @@ def read_test_pair_features(face_path, voice_path, face_dim=4096, voice_dim=192)
     return torch.from_numpy(face_test).float(), torch.from_numpy(voice_test).float()
 
 
+def load_run_model_cfg(ckpt_path, cfg):
+    run_cfg_path = os.path.join(os.path.dirname(ckpt_path), "config.yaml")
+    if not os.path.exists(run_cfg_path):
+        return cfg.model
+    run_cfg = load_config(run_cfg_path)
+    for key in ("face_dim", "voice_dim"):
+        if getattr(run_cfg.data.train, key) != getattr(cfg.data.train, key):
+            raise ValueError(
+                f"{ckpt_path}: {key}={getattr(run_cfg.data.train, key)} differs from --config "
+                f"({getattr(cfg.data.train, key)}); ensemble members must share input features"
+            )
+    return run_cfg.model
+
+
 def evaluate_and_generate_scores(
     cfg,
     ckpt_paths,
@@ -63,7 +77,10 @@ def evaluate_and_generate_scores(
     for ckpt_path in ckpt_paths:
         checkpoint = torch.load(ckpt_path, weights_only=False, map_location=device)
         n_class = checkpoint.get("n_class", 70) if isinstance(checkpoint, dict) else 70
-        model = FOP(cfg.model, face_dim, voice_dim, n_class).to(device)
+        # Build each model from the config saved next to its checkpoint (output/<run>/s<seed>/config.yaml),
+        # so ensembles can mix architectures (e.g. egff + gated). Falls back to --config.
+        model_cfg = load_run_model_cfg(ckpt_path, cfg)
+        model = FOP(model_cfg, face_dim, voice_dim, n_class).to(device)
         state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
         model.load_state_dict(state_dict)
         model.eval()
@@ -154,6 +171,12 @@ if __name__ == "__main__":
     missing = [c for c in ckpts if not os.path.exists(c)]
     if missing:
         parser.error(f"checkpoint(s) not found: {missing}")
+
+    if args.run and args.seeds:
+        # meta.json is written when training finishes; without it the checkpoint may be a partial run
+        unfinished = [c for c in ckpts if not os.path.exists(os.path.join(os.path.dirname(c), "meta.json"))]
+        if unfinished:
+            parser.error(f"unfinished runs (no meta.json), retrain these seeds: {unfinished}")
 
     cfg = load_config(args.config)
     tracks = ["no_gender", "gender"] if args.track == "all" else [args.track]
