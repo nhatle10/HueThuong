@@ -8,14 +8,15 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from src.config import load_config
-from src.data import read_train_data, make_local_val_split
+from src.data import read_train_data, make_local_val_split, read_class_genders
 from src.evaluation import evaluate_model
-from src.losses import OrthogonalProjectionLoss
+from src.losses import OrthogonalProjectionLoss, PreciseAlignmentLoss
 from src.models import FOP
+from src.utils.paths import alpha_dir, init_run, write_meta
+
 
 
 class RunningAverage:
-
     def __init__(self):
         self.steps = 0
         self.total = 0
@@ -27,6 +28,26 @@ class RunningAverage:
     def avg(self):
         return self.total / float(self.steps)
 
+# LEGACY (EXP-04, negative result, see EXPERIMENTS.md): `genders` gives single-gender batches.
+# Off by default; only used when train.gender_batches is true.
+def make_batches(n_samples, batch_size, genders=None):
+    """Index batches. With genders, each batch is single-gender so every in-batch negative is same-gender."""
+    if genders is None:
+        perm = np.random.permutation(n_samples)
+        return [perm[i : i + batch_size] for i in range(0, n_samples, batch_size)]
+
+    batches, leftovers = [], []
+    for g in np.unique(genders):
+        idx = np.random.permutation(np.where(genders == g)[0])
+        full = len(idx) // batch_size * batch_size
+        batches += [idx[i : i + batch_size] for i in range(0, full, batch_size)]
+        leftovers.append(idx[full:])
+    rest = np.random.permutation(np.concatenate(leftovers))
+    if len(rest) > 1:
+        batches.append(rest)  # one small mixed batch
+    np.random.shuffle(batches)
+    return batches
+
 
 def train_epoch(
     face_feats,
@@ -34,55 +55,110 @@ def train_epoch(
     labels,
     model,
     optimizer,
-    ce_loss,
-    opl_loss,
-    alpha,
+    losses,
+    weights,
     device,
 ):
     model.train()
-    face_feats = torch.from_numpy(face_feats).float().to(device)
-    voice_feats = torch.from_numpy(voice_feats).float().to(device)
-    labels = torch.from_numpy(labels).to(device)
+    # face_feats / voice_feats / labels are already device tensors (see fit)
 
-    comb, _, _ = model.train_forward(face_feats, voice_feats, labels)
-    loss_opl, _, _ = opl_loss(comb[0], labels)
-    loss_soft = ce_loss(comb[1], labels)
-    loss = loss_soft + alpha * loss_opl
+    comb, face_embeds, voice_embeds = model.train_forward(face_feats, voice_feats, labels)
+
+    # [1] Get base losses
+    loss_opl, _, _ = losses["opl"](comb[0], labels)
+    loss_soft = losses["ce"](comb[1], labels)
+
+    alpha_ce = weights.get("alpha_ce", 1.0)
+    alpha_opl = weights.get("alpha_opl", 1.0)
+    alpha_align = weights.get("alpha_align", 0.0)
+
+    loss = alpha_ce * loss_soft + alpha_opl * loss_opl
+    align_val = 0.0
+
+    # [2] Alignment loss (if present in losses dict and weight > 0)
+    if "align" in losses and losses["align"] is not None and alpha_align > 0:
+        loss_align = losses["align"](face_embeds, voice_embeds)
+        loss = loss + alpha_align * loss_align
+        align_val = loss_align.item()
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    return loss.item(), loss_opl.item(), loss_soft.item()
+    return loss.item(), loss_opl.item(), loss_soft.item(), align_val
 
 
-def fit(
-    tr_faces,
-    tr_voices,
-    tr_labels,
-    val_faces,
-    val_voices,
-    val_targets,
-    n_class,
-    cfg,
-):
+def save_training_plots(history, save_dir, run_name):
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    epochs = range(1, len(history["loss"]) + 1)
+
+    # Subplot 1: Losses
+    axes[0].plot(epochs, history["loss"], label="Total Loss", color="black", linewidth=2)
+    axes[0].plot(epochs, history["ce"], label="Cross-Entropy", linestyle="--")
+    axes[0].plot(epochs, history["opl"], label="OPL", linestyle="--")
+    if any(a > 0 for a in history.get("align", [])):
+        axes[0].plot(epochs, history["align"], label="Alignment", linestyle="--")
+    axes[0].set_title(f"Training Losses ({run_name})")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    # Subplot 2: Validation Metrics
+    if history.get("val_eer") and len(history["val_eer"]) > 0:
+        val_epochs = range(1, len(history["val_eer"]) + 1)
+        axes[1].plot(val_epochs, history["val_eer"], label="Val EER (%)", color="crimson", linewidth=2)
+        best_idx = int(np.argmin(history["val_eer"]))
+        best_val = history["val_eer"][best_idx]
+        axes[1].scatter(
+            best_idx + 1,
+            best_val,
+            color="blue",
+            s=100,
+            zorder=5,
+            label=f"Best: {best_val:.2f}% (Epoch {best_idx+1})",
+        )
+        axes[1].set_title("Open-Set Validation EER")
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("EER (%)")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    os.makedirs(save_dir, exist_ok=True)
+    plot_path = os.path.join(save_dir, f"{run_name}_curves.png")
+    plt.savefig(plot_path, dpi=200)
+    plt.close()
+    print(f"\n  --> Saved training curves plot to {plot_path}")
+
+
+def fit(tr_faces, tr_voices, tr_labels, tr_genders, val_faces, val_voices, val_targets, n_class, cfg):
     device = torch.device(
         "cuda" if cfg.model.cuda and torch.cuda.is_available() else "cpu"
     )
     print(f"Using device: {device}")
 
-    os.makedirs(cfg.run.save_dir, exist_ok=True)
-    os.makedirs("output", exist_ok=True)
+    # Keep the whole training set on the device: no per-batch host->device copies
+    tr_faces_t = torch.from_numpy(tr_faces).float().to(device)
+    tr_voices_t = torch.from_numpy(tr_voices).float().to(device)
+    tr_labels_t = torch.from_numpy(tr_labels).long().to(device)
+
+    os.makedirs(cfg.run.out_dir, exist_ok=True)
 
     n_samples = tr_faces.shape[0]
-    alphas = (
-        cfg.train.alpha_list
-        if isinstance(cfg.train.alpha_list, list)
-        else [float(cfg.train.alpha_list)]
-    )
+    alphas = getattr(cfg.train, "alpha_list", None)
+    # LEGACY (EXP-04): gender-pure batching, off unless train.gender_batches is true
+    use_gender = getattr(cfg.train, "gender_batches", False) and tr_genders is not None
+
+    if alphas is None:
+        alphas = [getattr(cfg.train, "alpha_opl", 1.0)]
+    elif not isinstance(alphas, list):
+        alphas = [float(alphas)]
 
     results = []
     for alpha in alphas:
+        out_dir = alpha_dir(cfg.run.out_dir, alpha, len(alphas) > 1)
         print(f"\n{'='*50}\nStarting Training with Alpha = {alpha}\n{'='*50}")
         model = FOP(
             cfg.model,
@@ -95,46 +171,69 @@ def fit(
             lr=cfg.train.lr,
             weight_decay=getattr(cfg.train, "weight_decay", 1e-4),
         )
-        ce_loss = nn.CrossEntropyLoss().to(device)
-        opl_loss = OrthogonalProjectionLoss(device).to(device)
+        losses = {
+            "ce": nn.CrossEntropyLoss().to(device),
+            "opl": OrthogonalProjectionLoss(device).to(device),
+            "align": (
+                PreciseAlignmentLoss(temperature=getattr(cfg.train, "temperature", 0.07)).to(device)
+                if getattr(cfg.train, "alpha_align", 0.0) > 0
+                else None
+            ),
+        }
+
+        weights = {
+            "alpha_ce": getattr(cfg.train, "alpha_ce", 1.0),
+            "alpha_opl": getattr(cfg.train, "alpha_opl", alpha),
+            "alpha_align": getattr(cfg.train, "alpha_align", 0.0),
+        }
 
         best_eer = float("inf")
         best_epoch = 0
         patience_count = 0
         eer_history = []
+        history = {
+            "loss": [],
+            "ce": [],
+            "opl": [],
+            "align": [],
+            "val_eer": [],
+            "val_auc": [],
+        }
 
         for epoch in range(1, cfg.train.max_num_epoch + 1):
-            perm = np.random.permutation(n_samples)
-            f_shuf, v_shuf, l_shuf = (
-                tr_faces[perm],
-                tr_voices[perm],
-                tr_labels[perm],
-            )
-
-            pbar = tqdm(
-                range(0, n_samples, cfg.train.batch_size),
-                desc=f"Epoch {epoch}/{cfg.train.max_num_epoch}",
-            )
-            for i in pbar:
-                fb = f_shuf[i : i + cfg.train.batch_size]
-                vb = v_shuf[i : i + cfg.train.batch_size]
-                lb = l_shuf[i : i + cfg.train.batch_size]
-                total_l, opl_l, ce_l = train_epoch(
+            batches = make_batches(n_samples, cfg.train.batch_size, tr_genders if use_gender else None)
+            pbar = tqdm(batches, desc=f"Epoch {epoch}/{cfg.train.max_num_epoch}")
+            ep_loss, ep_ce, ep_opl, ep_align, n_batches = 0.0, 0.0, 0.0, 0.0, 0
+            
+            for idx in pbar:
+                idx_t = torch.from_numpy(idx).to(device)
+                fb, vb, lb = tr_faces_t[idx_t], tr_voices_t[idx_t], tr_labels_t[idx_t]
+                total_l, opl_l, ce_l, align_l = train_epoch(
                     fb,
                     vb,
                     lb,
                     model,
                     optimizer,
-                    ce_loss,
-                    opl_loss,
-                    alpha,
+                    losses,
+                    weights,
                     device,
                 )
+                ep_loss += total_l
+                ep_ce += ce_l
+                ep_opl += opl_l
+                ep_align += align_l
+                n_batches += 1
                 pbar.set_postfix(
                     loss=f"{total_l:.4f}",
                     ce=f"{ce_l:.4f}",
                     opl=f"{opl_l:.4f}",
+                    align=f"{align_l:.4f}",
                 )
+
+            history["loss"].append(ep_loss / max(1, n_batches))
+            history["ce"].append(ep_ce / max(1, n_batches))
+            history["opl"].append(ep_opl / max(1, n_batches))
+            history["align"].append(ep_align / max(1, n_batches))
 
             # Evaluate on genuine local validation set
             if val_faces is not None and val_targets is not None:
@@ -143,6 +242,8 @@ def fit(
                 )
                 val_eer, val_auc = val_res.eer, val_res.auc
                 eer_history.append(val_eer)
+                history["val_eer"].append(val_eer * 100.0)
+                history["val_auc"].append(val_auc)
                 print(
                     f"[Epoch {epoch:03d}] Local Val: EER={val_eer*100:.2f}%, AUC={val_auc:.4f} | "
                     f"10-Fold: EER={val_res.legacy_eer*100:.2f}%, Acc={val_res.legacy_acc*100:.1f}%"
@@ -152,10 +253,7 @@ def fit(
                     best_eer = val_eer
                     best_epoch = epoch
                     patience_count = 0
-                    ckpt_path = os.path.join(
-                        cfg.run.save_dir,
-                        f"{cfg.model.fusion}_{cfg.run.tag}_{alpha:.2f}_best.pth.tar",
-                    )
+                    ckpt_path = os.path.join(out_dir, "best.pth.tar")
                     torch.save(
                         {
                             "epoch": epoch,
@@ -173,10 +271,7 @@ def fit(
                         break
             else:
                 # Full train mode: save periodically
-                ckpt_path = os.path.join(
-                    cfg.run.save_dir,
-                    f"{cfg.model.fusion}_{cfg.run.tag}_{alpha:.2f}_best.pth.tar",
-                )
+                ckpt_path = os.path.join(out_dir, "best.pth.tar")
                 torch.save(
                     {
                         "epoch": epoch,
@@ -186,6 +281,15 @@ def fit(
                     ckpt_path,
                 )
 
+        save_training_plots(history, out_dir, f"{cfg.run.name}_s{cfg.run.seed}")
+        write_meta(
+            out_dir,
+            seed=cfg.run.seed,
+            alpha=alpha,
+            best_epoch=best_epoch,
+            best_val_eer=None if best_eer == float("inf") else best_eer,
+            n_class=n_class,
+        )
         results.append((alpha, best_eer, best_epoch))
 
     print(f"\n{'='*50}\nSUMMARY ({cfg.run.tag})\n{'='*50}")
@@ -197,6 +301,13 @@ def fit(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Face-Voice Retrieval Model")
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Override model-init seed (ensemble member). The local val split "
+        "stays fixed on run.split_seed (default: run.seed in the config).",
+    )
+    parser.add_argument(
         "--config",
         type=str,
         default="configs/baseline.yaml",
@@ -206,22 +317,31 @@ if __name__ == "__main__":
 
     cfg = load_config(args.config)
 
-    # Set seeds
+    # Val split seed is decoupled from init seed so ensemble members share one split
+    split_seed = getattr(cfg.run, "split_seed", cfg.run.seed)
+    if args.seed is not None:
+        cfg.run.seed = args.seed
+
+    cfg.run.out_dir = init_run(cfg, args.config)
+    print(f"Run directory: {cfg.run.out_dir}")
+
     torch.manual_seed(cfg.run.seed)
     random.seed(cfg.run.seed)
     np.random.seed(cfg.run.seed)
     if cfg.model.cuda and torch.cuda.is_available():
         torch.cuda.manual_seed(cfg.run.seed)
 
+
     face_train, voice_train, train_labels = read_train_data(cfg)
 
     n_val_speakers = getattr(cfg.train, "val_speakers", 10)
-    (tr_faces, tr_voices, tr_labels, n_class), (val_faces, val_voices, val_targets) = make_local_val_split(
-        face_train,
-        voice_train,
-        train_labels,
+    genders = read_class_genders(cfg.data.train.meta_csv, int(train_labels.max()) + 1, getattr(cfg.data.train, "train_list", None))
+    (tr_faces, tr_voices, tr_labels, n_class, tr_genders), (val_faces, val_voices, val_targets) = make_local_val_split(
+        face_train, voice_train, train_labels,
         n_val_speakers=n_val_speakers,
-        seed=cfg.run.seed,
+        seed=split_seed,
+        genders=genders,
+        val_gender_matched=getattr(cfg.train, "val_gender_matched", False),
     )
 
     if val_faces is not None:
@@ -233,14 +353,6 @@ if __name__ == "__main__":
     else:
         print("  [Validation] None (training on 100% of available samples)")
 
-    fit(
-        tr_faces,
-        tr_voices,
-        tr_labels,
-        val_faces,
-        val_voices,
-        val_targets,
-        n_class,
-        cfg,
-    )
+    fit(tr_faces, tr_voices, tr_labels, tr_genders, val_faces, val_voices, val_targets, n_class, cfg)
+
 
