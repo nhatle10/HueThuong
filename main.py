@@ -28,6 +28,8 @@ class RunningAverage:
     def avg(self):
         return self.total / float(self.steps)
 
+# LEGACY (EXP-04, negative result, see EXPERIMENTS.md): `genders` gives single-gender batches.
+# Off by default; only used when train.gender_batches is true.
 def make_batches(n_samples, batch_size, genders=None):
     """Index batches. With genders, each batch is single-gender so every in-batch negative is same-gender."""
     if genders is None:
@@ -35,18 +37,15 @@ def make_batches(n_samples, batch_size, genders=None):
         return [perm[i : i + batch_size] for i in range(0, n_samples, batch_size)]
 
     batches, leftovers = [], []
-
     for g in np.unique(genders):
         idx = np.random.permutation(np.where(genders == g)[0])
         full = len(idx) // batch_size * batch_size
         batches += [idx[i : i + batch_size] for i in range(0, full, batch_size)]
         leftovers.append(idx[full:])
-
     rest = np.random.permutation(np.concatenate(leftovers))
     if len(rest) > 1:
         batches.append(rest)  # one small mixed batch
     np.random.shuffle(batches)
-
     return batches
 
 
@@ -61,9 +60,7 @@ def train_epoch(
     device,
 ):
     model.train()
-    face_feats = torch.from_numpy(face_feats).float().to(device)
-    voice_feats = torch.from_numpy(voice_feats).float().to(device)
-    labels = torch.from_numpy(labels).to(device)
+    # face_feats / voice_feats / labels are already device tensors (see fit)
 
     comb, face_embeds, voice_embeds = model.train_forward(face_feats, voice_feats, labels)
 
@@ -142,10 +139,16 @@ def fit(tr_faces, tr_voices, tr_labels, tr_genders, val_faces, val_voices, val_t
     )
     print(f"Using device: {device}")
 
+    # Keep the whole training set on the device: no per-batch host->device copies
+    tr_faces_t = torch.from_numpy(tr_faces).float().to(device)
+    tr_voices_t = torch.from_numpy(tr_voices).float().to(device)
+    tr_labels_t = torch.from_numpy(tr_labels).long().to(device)
+
     os.makedirs(cfg.run.out_dir, exist_ok=True)
 
     n_samples = tr_faces.shape[0]
     alphas = getattr(cfg.train, "alpha_list", None)
+    # LEGACY (EXP-04): gender-pure batching, off unless train.gender_batches is true
     use_gender = getattr(cfg.train, "gender_batches", False) and tr_genders is not None
 
     if alphas is None:
@@ -203,7 +206,8 @@ def fit(tr_faces, tr_voices, tr_labels, tr_genders, val_faces, val_voices, val_t
             ep_loss, ep_ce, ep_opl, ep_align, n_batches = 0.0, 0.0, 0.0, 0.0, 0
             
             for idx in pbar:
-                fb, vb, lb = tr_faces[idx], tr_voices[idx], tr_labels[idx]
+                idx_t = torch.from_numpy(idx).to(device)
+                fb, vb, lb = tr_faces_t[idx_t], tr_voices_t[idx_t], tr_labels_t[idx_t]
                 total_l, opl_l, ce_l, align_l = train_epoch(
                     fb,
                     vb,

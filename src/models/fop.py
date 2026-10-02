@@ -65,14 +65,20 @@ class GatedFusion(nn.Module):
         voice_trans = torch.tanh(voice_embed)
         fused = face_trans * att + (1.0 - att) * voice_trans
         return fused, face_embed, voice_embed
+
 class EmbedBranch(nn.Module):
-    def __init__(self, feat_dim: int, dim_embed: int, n_layers: int = 1, dropout: float = 0.5):
+    def __init__(self, feat_dim: int, dim_embed: int, n_layers: int = 1,
+                 dropout: float = 0.5, input_dropout: float = 0.0):
         super(EmbedBranch, self).__init__()
+        self.in_drop = nn.Dropout(p=input_dropout)  # masks raw backbone features
         self.fc1 = make_fc_1d(feat_dim, dim_embed, n_layers=n_layers, dropout=dropout)
+
     def forward(self, x):
+        x = self.in_drop(x)
         x = self.fc1(x)
         x = F.normalize(x, p=2, dim=1)
         return x
+
 
 class EnhancedGatedFusion(nn.Module):
     """
@@ -108,8 +114,14 @@ class FOP(nn.Module):
         n_layers = getattr(model_cfg, "n_layers", 1)
         dropout = getattr(model_cfg, "dropout", 0.5)
 
-        self.voice_branch = EmbedBranch(voice_feat_dim, self.dim_embed, n_layers=n_layers, dropout=dropout)
-        self.face_branch = EmbedBranch(face_feat_dim, self.dim_embed, n_layers=n_layers, dropout=dropout)
+        in_drop = getattr(model_cfg, "input_dropout", 0.0)
+        in_drop_face = getattr(model_cfg, "input_dropout_face", in_drop)
+        in_drop_voice = getattr(model_cfg, "input_dropout_voice", in_drop)
+
+        self.voice_branch = EmbedBranch(voice_feat_dim, self.dim_embed, n_layers=n_layers,
+                                        dropout=dropout, input_dropout=in_drop_voice)
+        self.face_branch = EmbedBranch(face_feat_dim, self.dim_embed, n_layers=n_layers,
+                                       dropout=dropout, input_dropout=in_drop_face)
 
         if self.fusion == "linear":
             self.fusion_layer = LinearWeightedAvg()

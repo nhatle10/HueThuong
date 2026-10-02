@@ -122,6 +122,7 @@ def make_local_val_split(
 
     return (tr_faces, tr_voices, tr_labels, len(tr_spks), tr_genders), (val_f, val_v, val_targets)
 
+# LEGACY (EXP-04, negative result): only needed for gender batching / gender-matched val.
 def read_class_genders(meta_csv: str, n_classes: int) -> np.ndarray:
     """
     Gender per original class id (0..n-1): 0 = female, 1 = male.
