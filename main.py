@@ -8,10 +8,12 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from src.config import load_config
-from src.data import read_train_data, make_local_val_split
+from src.data import read_train_data, make_local_val_split, read_class_genders
 from src.evaluation import evaluate_model
 from src.losses import OrthogonalProjectionLoss, PreciseAlignmentLoss
 from src.models import FOP
+from src.utils.paths import alpha_dir, init_run, write_meta
+
 
 
 class RunningAverage:
@@ -25,6 +27,27 @@ class RunningAverage:
 
     def avg(self):
         return self.total / float(self.steps)
+
+def make_batches(n_samples, batch_size, genders=None):
+    """Index batches. With genders, each batch is single-gender so every in-batch negative is same-gender."""
+    if genders is None:
+        perm = np.random.permutation(n_samples)
+        return [perm[i : i + batch_size] for i in range(0, n_samples, batch_size)]
+
+    batches, leftovers = [], []
+
+    for g in np.unique(genders):
+        idx = np.random.permutation(np.where(genders == g)[0])
+        full = len(idx) // batch_size * batch_size
+        batches += [idx[i : i + batch_size] for i in range(0, full, batch_size)]
+        leftovers.append(idx[full:])
+
+    rest = np.random.permutation(np.concatenate(leftovers))
+    if len(rest) > 1:
+        batches.append(rest)  # one small mixed batch
+    np.random.shuffle(batches)
+
+    return batches
 
 
 def train_epoch(
@@ -113,36 +136,26 @@ def save_training_plots(history, save_dir, run_name):
     print(f"\n  --> Saved training curves plot to {plot_path}")
 
 
-def fit(
-    tr_faces,
-    tr_voices,
-    tr_labels,
-    val_faces,
-    val_voices,
-    val_targets,
-    n_class,
-    cfg,
-):
+def fit(tr_faces, tr_voices, tr_labels, tr_genders, val_faces, val_voices, val_targets, n_class, cfg):
     device = torch.device(
         "cuda" if cfg.model.cuda and torch.cuda.is_available() else "cpu"
     )
     print(f"Using device: {device}")
 
-    os.makedirs(cfg.run.save_dir, exist_ok=True)
-    os.makedirs("output", exist_ok=True)
+    os.makedirs(cfg.run.out_dir, exist_ok=True)
 
     n_samples = tr_faces.shape[0]
-
     alphas = getattr(cfg.train, "alpha_list", None)
+    use_gender = getattr(cfg.train, "gender_batches", False) and tr_genders is not None
+
     if alphas is None:
         alphas = [getattr(cfg.train, "alpha_opl", 1.0)]
     elif not isinstance(alphas, list):
         alphas = [float(alphas)]
 
-
-
     results = []
     for alpha in alphas:
+        out_dir = alpha_dir(cfg.run.out_dir, alpha, len(alphas) > 1)
         print(f"\n{'='*50}\nStarting Training with Alpha = {alpha}\n{'='*50}")
         model = FOP(
             cfg.model,
@@ -185,22 +198,12 @@ def fit(
         }
 
         for epoch in range(1, cfg.train.max_num_epoch + 1):
-            perm = np.random.permutation(n_samples)
-            f_shuf, v_shuf, l_shuf = (
-                tr_faces[perm],
-                tr_voices[perm],
-                tr_labels[perm],
-            )
-
-            pbar = tqdm(
-                range(0, n_samples, cfg.train.batch_size),
-                desc=f"Epoch {epoch}/{cfg.train.max_num_epoch}",
-            )
+            batches = make_batches(n_samples, cfg.train.batch_size, tr_genders if use_gender else None)
+            pbar = tqdm(batches, desc=f"Epoch {epoch}/{cfg.train.max_num_epoch}")
             ep_loss, ep_ce, ep_opl, ep_align, n_batches = 0.0, 0.0, 0.0, 0.0, 0
-            for i in pbar:
-                fb = f_shuf[i : i + cfg.train.batch_size]
-                vb = v_shuf[i : i + cfg.train.batch_size]
-                lb = l_shuf[i : i + cfg.train.batch_size]
+            
+            for idx in pbar:
+                fb, vb, lb = tr_faces[idx], tr_voices[idx], tr_labels[idx]
                 total_l, opl_l, ce_l, align_l = train_epoch(
                     fb,
                     vb,
@@ -246,10 +249,7 @@ def fit(
                     best_eer = val_eer
                     best_epoch = epoch
                     patience_count = 0
-                    ckpt_path = os.path.join(
-                        cfg.run.save_dir,
-                        f"{cfg.model.fusion}_{cfg.run.tag}_{alpha:.2f}_best.pth.tar",
-                    )
+                    ckpt_path = os.path.join(out_dir, "best.pth.tar")
                     torch.save(
                         {
                             "epoch": epoch,
@@ -267,10 +267,7 @@ def fit(
                         break
             else:
                 # Full train mode: save periodically
-                ckpt_path = os.path.join(
-                    cfg.run.save_dir,
-                    f"{cfg.model.fusion}_{cfg.run.tag}_{alpha:.2f}_best.pth.tar",
-                )
+                ckpt_path = os.path.join(out_dir, "best.pth.tar")
                 torch.save(
                     {
                         "epoch": epoch,
@@ -280,7 +277,15 @@ def fit(
                     ckpt_path,
                 )
 
-        save_training_plots(history, "output", f"{cfg.run.name}_{cfg.model.fusion}_{alpha:.2f}")
+        save_training_plots(history, out_dir, f"{cfg.run.name}_s{cfg.run.seed}")
+        write_meta(
+            out_dir,
+            seed=cfg.run.seed,
+            alpha=alpha,
+            best_epoch=best_epoch,
+            best_val_eer=None if best_eer == float("inf") else best_eer,
+            n_class=n_class,
+        )
         results.append((alpha, best_eer, best_epoch))
 
     print(f"\n{'='*50}\nSUMMARY ({cfg.run.tag})\n{'='*50}")
@@ -307,29 +312,32 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+
     # Val split seed is decoupled from init seed so ensemble members share one split
     split_seed = getattr(cfg.run, "split_seed", cfg.run.seed)
     if args.seed is not None:
         cfg.run.seed = args.seed
-        cfg.run.tag = f"{cfg.run.tag}_s{args.seed}"
-        cfg.run.name = f"{cfg.run.name}_s{args.seed}"
 
-    # Set seeds
+    cfg.run.out_dir = init_run(cfg, args.config)
+    print(f"Run directory: {cfg.run.out_dir}")
+
     torch.manual_seed(cfg.run.seed)
     random.seed(cfg.run.seed)
     np.random.seed(cfg.run.seed)
     if cfg.model.cuda and torch.cuda.is_available():
         torch.cuda.manual_seed(cfg.run.seed)
 
+
     face_train, voice_train, train_labels = read_train_data(cfg)
 
     n_val_speakers = getattr(cfg.train, "val_speakers", 10)
-    (tr_faces, tr_voices, tr_labels, n_class), (val_faces, val_voices, val_targets) = make_local_val_split(
-        face_train,
-        voice_train,
-        train_labels,
+    genders = read_class_genders(cfg.data.train.meta_csv, int(train_labels.max()) + 1)
+    (tr_faces, tr_voices, tr_labels, n_class, tr_genders), (val_faces, val_voices, val_targets) = make_local_val_split(
+        face_train, voice_train, train_labels,
         n_val_speakers=n_val_speakers,
         seed=split_seed,
+        genders=genders,
+        val_gender_matched=getattr(cfg.train, "val_gender_matched", False),
     )
 
     if val_faces is not None:
@@ -341,14 +349,6 @@ if __name__ == "__main__":
     else:
         print("  [Validation] None (training on 100% of available samples)")
 
-    fit(
-        tr_faces,
-        tr_voices,
-        tr_labels,
-        val_faces,
-        val_voices,
-        val_targets,
-        n_class,
-        cfg,
-    )
+    fit(tr_faces, tr_voices, tr_labels, tr_genders, val_faces, val_voices, val_targets, n_class, cfg)
+
 

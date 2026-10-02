@@ -21,6 +21,7 @@ def evaluate_and_generate_scores(
     track="no_gender",
     heard_lang="English",
     compute_dummy_metrics=False,
+    out_dir="output/sub_score_v4"
 ):
     unheard_lang = "Bangla" if heard_lang == "English" else "English"
     dev_root = cfg.data.dev.root
@@ -83,7 +84,7 @@ def evaluate_and_generate_scores(
         keys_u = [line.strip().split()[0] for line in f if line.strip()]
 
     # 5. Save challenge submission files
-    out_dir = os.path.join("output", "sub_score_v4", track)
+    out_dir = os.path.join(out_dir, track)
     os.makedirs(out_dir, exist_ok=True)
 
     out_h = os.path.join(out_dir, f"sub_score_v4_{heard_lang}_heard.txt")
@@ -123,54 +124,50 @@ def evaluate_and_generate_scores(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate Challenge Submissions")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/baseline.yaml",
-        help="Path to YAML config",
-    )
-    parser.add_argument("--ckpt", type=str, nargs="+", required=True,
-                        help="Checkpoint path(s); multiple are score-averaged")
-
-    parser.add_argument(
-        "--track",
-        type=str,
-        default="all",
-        choices=["all", "no_gender", "gender"],
-    )
-    parser.add_argument(
-        "--heard_lang",
-        type=str,
-        default="English",
-        choices=["English", "Bangla"],
-    )
-    parser.add_argument(
-        "--create_zip",
-        action="store_true",
-        default=True,
-        help="Create official submission.zip package",
-    )
-    parser.add_argument(
-        "--compute_dummy_metrics",
-        action="store_true",
-        default=False,
-        help="Compute legacy dummy alternating metrics (not recommended)",
-    )
+    parser.add_argument("--config", type=str, default="configs/baseline.yaml")
+    parser.add_argument("--run", type=str, default=None,
+                        help="Run directory, e.g. output/exp01_paeff (use with --seeds)")
+    parser.add_argument("--seeds", type=int, nargs="+", default=None,
+                        help="Seeds to ensemble from --run")
+    parser.add_argument("--ckpt", type=str, nargs="+", default=None,
+                        help="Explicit checkpoint path(s); alternative to --run/--seeds")
+    parser.add_argument("--out_dir", type=str, default=None,
+                        help="Where to write scores and submission.zip")
+    parser.add_argument("--track", type=str, default="all",
+                        choices=["all", "no_gender", "gender"])
+    parser.add_argument("--heard_lang", type=str, default="English",
+                        choices=["English", "Bangla"])
+    parser.add_argument("--create_zip", action="store_true", default=True)
+    parser.add_argument("--compute_dummy_metrics", action="store_true", default=False)
     args = parser.parse_args()
+
+    if args.run and args.seeds:
+        ckpts = [os.path.join(args.run, f"s{s}", "best.pth.tar") for s in args.seeds]
+        tag = "-".join(str(s) for s in args.seeds)
+        out_root = args.out_dir or os.path.join(args.run, f"submission_s{tag}")
+    elif args.ckpt:
+        ckpts = args.ckpt
+        out_root = args.out_dir or os.path.join("output", "sub_score_v4")
+    else:
+        parser.error("provide either --run with --seeds, or --ckpt")
+
+    missing = [c for c in ckpts if not os.path.exists(c)]
+    if missing:
+        parser.error(f"checkpoint(s) not found: {missing}")
 
     cfg = load_config(args.config)
     tracks = ["no_gender", "gender"] if args.track == "all" else [args.track]
 
     all_res = {}
     for t in tracks:
-        res = evaluate_and_generate_scores(
+        all_res[t] = evaluate_and_generate_scores(
             cfg,
-            args.ckpt,
+            ckpts,
             track=t,
             heard_lang=args.heard_lang,
             compute_dummy_metrics=args.compute_dummy_metrics,
+            out_dir=out_root,
         )
-        all_res[t] = res
 
     expected_files = [
         "no_gender/sub_score_v4_English_heard.txt",
@@ -178,13 +175,12 @@ if __name__ == "__main__":
         "gender/sub_score_v4_English_heard.txt",
         "gender/sub_score_v4_Bangla_unheard.txt",
     ]
-    
-    ckpt_str = "+".join(args.ckpt)
-    print(f"\n{'='*75}\nSUBMISSION SUMMARY ({ckpt_str})\n{'='*75}")
+
+    print(f"\n{'='*75}\nSUBMISSION SUMMARY ({'+'.join(ckpts)})\n{'='*75}")
     print(f"{'Cell':<45}{'Status':<15}{'Trials'}")
     print("-" * 75)
     for rel in expected_files:
-        full = os.path.join("output", "sub_score_v4", rel)
+        full = os.path.join(out_root, rel)
         status = "Ready" if os.path.exists(full) else "Missing"
         lines = 0
         if os.path.exists(full):
@@ -195,13 +191,12 @@ if __name__ == "__main__":
 
     if args.create_zip and len(all_res) == 2:
         import zipfile
-        zip_path = os.path.join("output", "submission.zip")
+
+        zip_path = os.path.join(out_root, "submission.zip")
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for rel in expected_files:
-                full = os.path.join("output", "sub_score_v4", rel)
+                full = os.path.join(out_root, rel)
                 if os.path.exists(full):
                     zf.write(full, arcname=rel)
         print(f"\n[Submission Package] Successfully created: {zip_path}")
-        print("Ready for upload to CodaLab / challenge submission portal!")
         print("(Note: Official EER is computed on the challenge server because dev_set labels are held out.)\n")
-

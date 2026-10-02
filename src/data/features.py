@@ -57,6 +57,8 @@ def make_local_val_split(
     labels_train: np.ndarray,
     n_val_speakers: int = 10,
     seed: int = 42,
+    genders: np.ndarray | None = None,
+    val_gender_matched: bool = False
 ):
     """
     Creates an open-set validation split from the training dataset.
@@ -65,9 +67,11 @@ def make_local_val_split(
     Returns:
         (tr_faces, tr_voices, tr_labels, n_tr_classes), (val_faces, val_voices, val_targets)
     """
+    sample_gender = genders[labels_train] if genders is not None else None
+
     if n_val_speakers <= 0:
         n_classes = int(np.max(labels_train)) + 1
-        return (face_train, voice_train, labels_train, n_classes), (None, None, None)
+        return (face_train, voice_train, labels_train, n_classes, sample_gender), (None, None, None)
 
     unique_speakers = np.unique(labels_train)
     rng = np.random.default_rng(seed)
@@ -83,10 +87,12 @@ def make_local_val_split(
     tr_faces = face_train[tr_mask]
     tr_voices = voice_train[tr_mask]
     tr_labels = np.array([spk_to_new_id[l] for l in labels_train[tr_mask]])
+    tr_genders = sample_gender[tr_mask] if sample_gender is not None else None
 
     v_faces = face_train[val_mask]
     v_voices = voice_train[val_mask]
     v_labels = labels_train[val_mask]
+    v_gender = sample_gender[val_mask] if sample_gender is not None else None
 
     # Positive pairs: face and voice from same sample
     pos_faces = v_faces
@@ -96,9 +102,14 @@ def make_local_val_split(
     # Negative pairs: mismatched face and voice from different speakers
     neg_voices = []
     for i, l in enumerate(v_labels):
-        diff_idx = np.where(v_labels != l)[0]
-        chosen = rng.choice(diff_idx)
+        cand = v_labels != l
+        if val_gender_matched and v_gender is not None:
+            matched = cand & (v_gender == v_gender[i])
+            if matched.any():
+                cand = matched
+        chosen = rng.choice(np.where(cand)[0])
         neg_voices.append(v_voices[chosen])
+
     neg_voices = np.array(neg_voices)
     neg_targets = np.zeros(len(v_faces), dtype=int)
 
@@ -109,5 +120,17 @@ def make_local_val_split(
     val_f = torch.from_numpy(val_f).float()
     val_v = torch.from_numpy(val_v).float()
 
-    return (tr_faces, tr_voices, tr_labels, len(tr_spks)), (val_f, val_v, val_targets)
+    return (tr_faces, tr_voices, tr_labels, len(tr_spks), tr_genders), (val_f, val_v, val_targets)
 
+def read_class_genders(meta_csv: str, n_classes: int) -> np.ndarray:
+    """
+    Gender per original class id (0..n-1): 0 = female, 1 = male.
+    Assumes row k <-> label k.
+    """
+    meta = pd.read_csv(meta_csv, header=None)
+    expected = [f"id{k + 1:03d}" for k in range(len(meta))]
+    
+    assert list(meta[0]) == expected, "meta ids not in label order; fix the mapping"
+    assert len(meta) >= n_classes
+
+    return (meta[1].str.strip().str.lower() == "m").astype(int).values
