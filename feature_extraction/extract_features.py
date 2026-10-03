@@ -3,7 +3,7 @@
 extract_features.py -- extra face/voice backbone features for the FLAG 2027 release.
 
     .venv/bin/python feature_extraction/extract_features.py --encoder ecapa2
-    (encoders: ecapa2, resnet293, wavlm_large, clip_l14, agegender_vit)
+    (encoders: ecapa2, resnet293, wavlm_large, clip_l14, clip_h14, siglip2, agegender_vit)
 
 Row contract (same as the existing VGGFace/ECAPA CSVs, so main.py/evaluate.py need no changes):
 * train: row i = line i of train_set/train_English.txt, features + class id (field 6)
@@ -24,6 +24,8 @@ Model weights (see scripts/extract_all.sh for downloads):
     resnet293     feature_extraction/models/resnet293/voxceleb_resnet293_LM.onnx   WeSpeaker, VoxCeleb2
     wavlm_large   microsoft/wavlm-large (HF cache)       mean over time, averaged over all hidden layers
     clip_l14      openai/clip-vit-large-patch14 (HF cache)   projected image embedding
+    clip_h14      laion/CLIP-ViT-H-14-laion2B-s32B-b79K (HF cache)   projected image embedding (1024)
+    siglip2       google/siglip2-so400m-patch14-224 (HF cache)       pooled image embedding (1152)
     agegender_vit feature_extraction/models/agegender/pytorch_model.bin   abhilash88/age-gender-prediction,
                   ViT-B/16 backbone, CLS token (the "last shared layer" used by the FAME 2026 winner)
 """
@@ -135,6 +137,39 @@ class CLIPL14(FaceEncoder):
         return self.model(pixel_values=px).image_embeds.float().cpu().numpy()
 
 
+class CLIPH14(CLIPL14):
+    """OpenCLIP ViT-H/14 (LAION-2B), transformers-format weights; projected image embedding."""
+    dim = 1024
+
+    def __init__(self, device):
+        from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+
+        repo = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+        self.device = device
+        self.proc = CLIPImageProcessor.from_pretrained(repo)
+        self.model = CLIPVisionModelWithProjection.from_pretrained(repo).to(device).eval()
+
+
+class SigLIP2(FaceEncoder):
+    """SigLIP 2 So400m/14 at 224px (matches the 224px face crops); pooled image embedding."""
+    dim = 1152
+
+    def __init__(self, device):
+        from transformers import AutoImageProcessor, AutoModel
+
+        repo = "google/siglip2-so400m-patch14-224"
+        self.device = device
+        self.proc = AutoImageProcessor.from_pretrained(repo)
+        self.model = AutoModel.from_pretrained(repo).to(device).eval()
+
+    @torch.inference_mode()
+    def embed_batch(self, images):
+        px = self.proc(images=images, return_tensors="pt").pixel_values.to(self.device)
+        out = self.model.get_image_features(pixel_values=px)
+        out = getattr(out, "pooler_output", out)  # some transformers versions return a model output
+        return out.float().cpu().numpy()
+
+
 class AgeGenderViT(FaceEncoder):
     dim = 768
 
@@ -168,6 +203,8 @@ ENCODERS = {
     "resnet293": ResNet293,
     "wavlm_large": WavLMLarge,
     "clip_l14": CLIPL14,
+    "clip_h14": CLIPH14,
+    "siglip2": SigLIP2,
     "agegender_vit": AgeGenderViT,
 }
 

@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 
 PY=".venv/bin/python"
 ROOT="data/FLAG_Grand_Challenge_2027_15_09_2027/train_set_extracted/train_set"
-if [ $# -gt 0 ]; then ENCODERS=("$@"); else ENCODERS=(agegender_vit clip_l14 ecapa2 resnet293 wavlm_large); fi
+if [ $# -gt 0 ]; then ENCODERS=("$@"); else ENCODERS=(agegender_vit clip_l14 clip_h14 siglip2 ecapa2 resnet293 wavlm_large); fi
 mkdir -p logs
 
 declare -A STATUS
