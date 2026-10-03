@@ -1,0 +1,42 @@
+run:
+  name: "exp07_noalign"
+  tag: "english"
+  seed: 1
+  save_dir: "output/checkpoints"
+
+data:
+  train:
+    faces: "data/FLAG_Grand_Challenge_2027_15_09_2027/train_set_extracted/train_set/features/faces/train_English_faces.csv"
+    voices: "data/FLAG_Grand_Challenge_2027_15_09_2027/train_set_extracted/train_set/features/voices/train_English_voices.csv"
+    meta_csv: "data/FLAG_Grand_Challenge_2027_15_09_2027/meta_file_train_set.csv"
+    face_dim: 4096
+    voice_dim: 192
+  dev:
+    root: "data/FLAG_Grand_Challenge_2027_15_09_2027/dev_set_extracted/dev_set"
+    tracks:
+      - "no_gender"
+      - "gender"
+    languages:
+      - "English"
+      - "Bangla"
+
+model:
+  name: "FOP"
+  fusion: "egff" # Enhanced Gated Feature Fusion
+  dim_embed: 128
+  cuda: true
+
+train:
+  batch_size: 128
+  lr: 0.0001
+  weight_decay: 0.0001
+  max_num_epoch: 200
+  patience: 20
+  min_delta: 0.0005
+  val_speakers: 10
+  alpha_list: null
+  # PAEFF Tri-Loss Hyperparameters
+  alpha_align: 0.0
+  alpha_opl: 0.35       # alpha_2: Orthogonal Projection Loss
+  alpha_ce: 0.35        # alpha_3: Classification Cross-Entropy Loss
+  temperature: 0.07     # InfoNCE scaling temperature
