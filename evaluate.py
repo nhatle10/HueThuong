@@ -26,6 +26,14 @@ def load_run_model_cfg(ckpt_path, cfg):
                 f"{ckpt_path}: {key}={getattr(run_cfg.data.train, key)} differs from --config "
                 f"({getattr(cfg.data.train, key)}); ensemble members must share input features"
             )
+    # same dims is not enough (ECAPA and ECAPA2 are both 192-d): the feature folder must match too
+    run_feat = getattr(run_cfg.data.dev, "features_dir", "features")
+    cli_feat = getattr(cfg.data.dev, "features_dir", "features")
+    if run_feat != cli_feat:
+        raise ValueError(
+            f"{ckpt_path}: trained with dev features '{run_feat}' but --config uses '{cli_feat}'; "
+            "ensemble members must share input features"
+        )
     return run_cfg.model
 
 
@@ -39,6 +47,8 @@ def evaluate_and_generate_scores(
 ):
     unheard_lang = "Bangla" if heard_lang == "English" else "English"
     dev_root = cfg.data.dev.root
+    # sub-folder of each track holding the dev CSVs, e.g. "features_ecapa2_cat" (see extract_features.py)
+    features_dir = getattr(cfg.data.dev, "features_dir", "features")
     face_dim = cfg.data.train.face_dim
     voice_dim = cfg.data.train.voice_dim
     device = torch.device(
@@ -51,20 +61,20 @@ def evaluate_and_generate_scores(
 
     # 1. Load heard and unheard test pairs
     face_h_path = os.path.join(
-        dev_root, track, "features", f"{heard_lang}_test_faces.csv"
+        dev_root, track, features_dir, f"{heard_lang}_test_faces.csv"
     )
     voice_h_path = os.path.join(
-        dev_root, track, "features", f"{heard_lang}_test_voices.csv"
+        dev_root, track, features_dir, f"{heard_lang}_test_voices.csv"
     )
     face_h, voice_h = read_test_pair_features(
         face_h_path, voice_h_path, face_dim, voice_dim
     )
 
     face_u_path = os.path.join(
-        dev_root, track, "features", f"{unheard_lang}_test_faces.csv"
+        dev_root, track, features_dir, f"{unheard_lang}_test_faces.csv"
     )
     voice_u_path = os.path.join(
-        dev_root, track, "features", f"{unheard_lang}_test_voices.csv"
+        dev_root, track, features_dir, f"{unheard_lang}_test_voices.csv"
     )
     face_u, voice_u = read_test_pair_features(
         face_u_path, voice_u_path, face_dim, voice_dim
